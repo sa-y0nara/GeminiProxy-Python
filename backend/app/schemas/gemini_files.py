@@ -80,7 +80,7 @@ class File(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("size_bytes", mode="before")
-    def validate_size_bytes(cls, v: str) -> str:
+    def validate_size_bytes(self, v: str) -> str:
         if isinstance(v, int):
             return str(v)
         try:
@@ -112,7 +112,7 @@ class FileMetadata(BaseModel):
     )
 
     @field_validator("size_bytes", mode="before")
-    def validate_size_bytes(cls, v: Optional[str]) -> Optional[str]:
+    def validate_size_bytes(self, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
         if isinstance(v, int):
