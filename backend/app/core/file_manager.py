@@ -18,7 +18,7 @@ import string
 
 from app.core.config import settings
 from app.core.log_utils import Logger
-from fastapi import UploadFile
+
 
 ISO_TIMESTAMP_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})T"
@@ -157,8 +157,8 @@ class FileManager:
         if temp_path.exists():
             try:
                 temp_path.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                logging.warning(f"Failed to remove existing chunk temp file {temp_path}: {e}")
         state = ChunkUploadState(temp_path=temp_path)
         self.chunk_upload_states[session_id] = state
         return state
@@ -201,8 +201,8 @@ class FileManager:
         if state and state.temp_path.exists():
             try:
                 state.temp_path.unlink()
-            except OSError:
-                pass
+            except OSError as e:
+                Logger.warning(f"Failed to delete temp file {state.temp_path}: {e}")
 
     # ========================================================================
     # 元数据管理

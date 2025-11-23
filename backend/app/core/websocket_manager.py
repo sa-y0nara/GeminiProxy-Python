@@ -1170,9 +1170,9 @@ class ConnectionManager:
         Logger.event("DELETE_START", "开始异步远程文件删除", client_id=client_id, file_name=file_name)
         try:
             # 创建一个虚拟的 Request 对象，因为这是后台任务
-            from unittest.mock import Mock
-            mock_request = Mock()
-            mock_request.is_disconnected = asyncio.coroutine(lambda: False)
+            async def always_connected():
+                return False
+            mock_request = SimpleNamespace(is_disconnected=always_connected)
 
             await self._direct_proxy_request(
                 command_type="delete_file",

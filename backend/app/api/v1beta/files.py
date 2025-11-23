@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse
@@ -589,7 +589,7 @@ async def resumable_upload(
     content_disposition = request.headers.get('content-disposition', '')
     if content_disposition:
         # 从 Content-Disposition 中解析文件名
-        import re
+
         filename_match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', content_disposition)
         if filename_match:
             filename = filename_match.group(1)
@@ -671,7 +671,7 @@ async def resumable_upload(
     if not inferred_name or inferred_name == "untitled":
         content_disposition = request.headers.get("content-disposition", "")
         if content_disposition:
-            import re
+
 
             filename_match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', content_disposition)
             if filename_match:

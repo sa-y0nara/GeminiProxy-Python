@@ -46,23 +46,6 @@ const sanitizePayloadSync = (payload: any) => {
  * Polls the Gemini API until the file state becomes ACTIVE or FAILED.
  * DISABLED for efficiency: Now returns immediately.
  */
-async function waitForFileActive(fileUri: string): Promise<any> {
-  // Optimization: Bypassing the check completely as requested to remove waiting mechanisms.
-  // We assume the file is ready immediately after upload.
-  return Promise.resolve({ state: 'ACTIVE' });
-  
-  /* 
-  // OLD LOGIC KEPT FOR REFERENCE IF NEEDED LATER:
-  const match = fileUri.match(/files\/[^/?#]+/);
-  if (!match) return null;
-  
-  const resourceName = match[0];
-  const cleanResourceName = resourceName.replace(/^files\/files\//, 'files/');
-  const url = `${GOOGLE_API_URL}/${cleanResourceName}`;
-  
-  // ... fetch loop ...
-  */
-}
 
 /**
  * Async payload fixer.

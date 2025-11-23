@@ -4,7 +4,6 @@
 """
 
 import asyncio
-import logging
 
 from app.core.log_utils import Logger
 

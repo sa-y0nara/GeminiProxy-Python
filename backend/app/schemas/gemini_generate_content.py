@@ -266,7 +266,7 @@ class Schema(BaseModel):
     maximum: float = Field(None, description="Optional. Maximum value of the Type.INTEGER and Type.NUMBER")
 
     @field_validator("min_items", "max_items", "min_properties", "max_properties", "min_length", "max_length")
-    def check_integer_format(cls, v: str) -> str:
+    def check_integer_format(self, v: str) -> str:
         if v is None:
             return v
         try:
