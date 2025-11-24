@@ -1,5 +1,5 @@
 import asyncio
-import base64
+import json
 import logging
 import random
 import uuid
@@ -206,6 +206,30 @@ class ConnectionManager:
 
         return await self._handle_non_streaming_request(websocket, command, request_id)
 
+    async def _send_binary_command(
+        self,
+        *,
+        client_id: str,
+        command: dict[str, Any],
+        binary_body: bytes,
+    ) -> Any:
+        """
+        发送携带原始文件数据的二进制命令。
+        """
+        if client_id not in self.active_connections:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Client {client_id} not connected.",
+            )
+
+        request_id = command.get("id")
+        if not request_id:
+            raise ValueError("Binary commands require an 'id' field.")
+
+        websocket = self.active_connections[client_id]
+        Logger.ws_send(request_id, client_id, command.get("type", "unknown"), command=command)
+        return await self._handle_binary_request(websocket, command, binary_body, request_id)
+
     async def proxy_request(
         self,
         command_type: str,
@@ -297,6 +321,67 @@ class ConnectionManager:
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Error communicating with frontend client: {str(e)}",
             )
+
+    async def _handle_binary_request(
+        self,
+        websocket: WebSocket,
+        command: dict[str, Any],
+        binary_body: bytes,
+        request_id: str,
+    ) -> Any:
+        """Handles a binary upload request."""
+        future = asyncio.get_running_loop().create_future()
+        self.pending_responses[request_id] = future
+        try:
+            packet = self._build_binary_packet(command, binary_body)
+            await websocket.send_bytes(packet)
+            response_payload = await asyncio.wait_for(future, timeout=settings.WEBSOCKET_TIMEOUT)
+            return response_payload
+        except asyncio.TimeoutError:
+            self._cleanup_request(request_id)
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Request to frontend client timed out",
+            )
+        except ApiException as e:
+            self._cleanup_request(request_id)
+            error_detail = e.detail or {}
+            error_message = error_detail.get("message", "").lower()
+            if "not found" in error_message or "file not found" in error_message:
+                file_name = command.get("payload", {}).get("fileName")
+                if not file_name and request_id in self.request_file_aliases:
+                    alias_map = self.request_file_aliases.get(request_id) or {}
+                    if len(alias_map) == 1:
+                        file_name = next(iter(alias_map.keys()))
+                    elif alias_map:
+                        Logger.warning(
+                            "无法确定具体缺失的文件，存在多个候选",
+                            request_id=request_id,
+                            aliases=list(alias_map.keys()),
+                        )
+                if file_name:
+                    sha256 = file_manager.get_sha256_by_filename(file_name)
+                    if sha256:
+                        Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
+                        file_manager.reset_replication_map(sha256)
+                        e.is_resettable = True
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        except Exception as e:
+            self._cleanup_request(request_id)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Error communicating with frontend client: {str(e)}",
+            )
+
+    def _build_binary_packet(self, command: dict[str, Any], binary_body: bytes) -> bytes:
+        """构造前端约定的二进制帧: [len][json][binary]."""
+        metadata_bytes = json.dumps(
+            command,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        header_bytes = len(metadata_bytes).to_bytes(4, byteorder="big", signed=False)
+        return header_bytes + metadata_bytes + (binary_body or b"")
 
     async def _get_file_mime_type(self, file_name: str, request_id: str) -> Optional[str]:
         """
@@ -987,11 +1072,11 @@ class ConnectionManager:
 
         try:
             file_bytes = entry.local_path.read_bytes()
+            file_size = len(file_bytes)
         except Exception as exc:
             file_manager.update_replication_status(sha256, client_id, "failed")
             raise HTTPException(status_code=500, detail=f"Failed to read cached file: {exc}") from exc
 
-        encoded_data = base64.b64encode(file_bytes).decode("utf-8")
         display_name = entry.original_filename or "untitled"
         mime_type = entry.mime_type or "application/octet-stream"
         size_bytes_str = str(entry.size_bytes)
@@ -1022,16 +1107,19 @@ class ConnectionManager:
             chunk_payload = {
                 "upload_url": upload_url,
                 "upload_offset": 0,
-                "content_length": entry.size_bytes,
+                "content_length": file_size,
                 "upload_command": "upload, finalize",
-                "data_base64": encoded_data,
             }
-            upload_response = await self._direct_proxy_request(
-                command_type="upload_chunk",
-                payload=chunk_payload,
-                request_id=f"{effective_request_id}-chunk",
+            chunk_request_id = f"{effective_request_id}-chunk"
+            chunk_command = {
+                "id": chunk_request_id,
+                "type": "upload_chunk",
+                "payload": chunk_payload,
+            }
+            upload_response = await self._send_binary_command(
                 client_id=client_id,
-                request=background_request,
+                command=chunk_command,
+                binary_body=file_bytes,
             )
         except Exception:
             file_manager.update_replication_status(sha256, client_id, "failed")
