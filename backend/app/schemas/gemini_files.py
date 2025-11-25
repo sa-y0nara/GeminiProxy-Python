@@ -8,6 +8,20 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 from .gemini_enums import Source, State
 
 
+def _coerce_numeric_string(value: Any, *, field_name: str, allow_none: bool = False) -> Optional[str]:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"'{field_name}' must be provided")
+    if isinstance(value, int):
+        return str(value)
+    try:
+        int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"'{field_name}' must be a string representing a numeric file size in bytes, but got '{value}'")
+    return str(value)
+
+
 class Status(BaseModel):
     code: int = Field(description="The status code, which should be an enum value of `google.rpc.Code`.")
     message: str = Field(
@@ -80,14 +94,8 @@ class File(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("size_bytes", mode="before")
-    def validate_size_bytes(self, v: str) -> str:
-        if isinstance(v, int):
-            return str(v)
-        try:
-            int(v)
-        except ValueError:
-            raise ValueError(f"'size_bytes' must be a string representing a numeric file size in bytes, but got '{v}'")
-        return v
+    def validate_size_bytes(cls, v: str) -> str:
+        return _coerce_numeric_string(v, field_name="size_bytes")
 
 
 class UploadFileResponse(BaseModel):
@@ -112,16 +120,8 @@ class FileMetadata(BaseModel):
     )
 
     @field_validator("size_bytes", mode="before")
-    def validate_size_bytes(self, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return v
-        if isinstance(v, int):
-            return str(v)
-        try:
-            int(v)
-        except ValueError:
-            raise ValueError(f"'sizeBytes' must be numeric, got '{v}'")
-        return v
+    def validate_size_bytes(cls, v: Optional[str]) -> Optional[str]:
+        return _coerce_numeric_string(v, field_name="sizeBytes", allow_none=True)
 
     model_config = ConfigDict(populate_by_name=True)
 

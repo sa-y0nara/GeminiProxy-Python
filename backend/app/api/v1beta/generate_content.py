@@ -1,4 +1,5 @@
 from typing import Annotated
+import uuid
 
 from app.core import manager
 from app.core.log_utils import Logger
@@ -8,6 +9,41 @@ from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
 
 router = APIRouter(tags=["Generating content"])
+
+
+async def _execute_generation(
+    *,
+    model: str,
+    payload: GenerateContentPayload,
+    request: Request,
+    is_stream: bool,
+):
+    request_id = str(uuid.uuid4())
+    action = "流式生成" if is_stream else "生成内容"
+    Logger.api_request(request_id, f"{action} | {model}")
+
+    request_payload = {
+        "model": model,
+        "payload": payload.model_dump(by_alias=True, exclude_none=True),
+    }
+
+    result = await manager.handle_api_request(
+        command_type="streamGenerateContent" if is_stream else "generateContent",
+        payload=request_payload,
+        request=request,
+        is_streaming=is_stream,
+    )
+
+    if not is_stream:
+        Logger.api_response(request_id, "生成完成")
+        return result
+
+    async def generator():
+        async for chunk in result:
+            yield chunk
+        Logger.api_response(request_id, "流式生成完成")
+
+    return StreamingResponse(generator())
 
 
 @router.post(
@@ -24,15 +60,7 @@ async def generate_content(
     """
     Generates a model response given an input GenerateContentRequest. Refer to the text generation guide for detailed usage information. Input capabilities differ between models, including tuned models. Refer to the model guide and tuning guide for details.
     """
-    Logger.api_request(None, f"生成内容 | {model}")
-    response_data = await manager.handle_api_request(
-        command_type="generateContent",
-        payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
-        request=request,
-        is_streaming=False,
-    )
-    Logger.api_response(None, "生成完成")
-    return response_data
+    return await _execute_generation(model=model, payload=payload, request=request, is_stream=False)
 
 
 @router.post(
@@ -48,17 +76,4 @@ async def stream_generate_content(
     """
     Generates a streamed response from the model given an input GenerateContentRequest.
     """
-    Logger.api_request(None, f"流式生成 | {model}")
-
-    async def generator():
-        response_generator = await manager.handle_api_request(
-            command_type="streamGenerateContent",
-            payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
-            request=request,
-            is_streaming=True,
-        )
-        async for chunk in response_generator:
-            yield chunk
-        Logger.api_response(None, "流式生成完成")
-
-    return StreamingResponse(generator())
+    return await _execute_generation(model=model, payload=payload, request=request, is_stream=True)

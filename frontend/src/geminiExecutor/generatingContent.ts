@@ -43,16 +43,18 @@ const sanitizePayloadSync = (payload: any) => {
 };
 
 /**
- * Polls the Gemini API until the file state becomes ACTIVE or FAILED.
- * DISABLED for efficiency: Now returns immediately.
- */
-
-/**
  * Async payload fixer.
  * 1. Normalizes URIs.
  * 2. (Skipped) Polls files to ensure they are ACTIVE.
  * 3. Updates MIME types from server metadata (Skipped if polling is disabled).
  */
+
+// Pre-compiled regex patterns for performance
+const NULL_BYTE_PATTERN = /\0/;
+const APPLICATION_PREFIX = /^application\//;
+const JSON_PATTERN = /json/;
+const PDF_PATTERN = /pdf/;
+
 const fixPayloadAsync = async (payload: any) => {
   const newPayload = sanitizePayloadSync(payload);
 
@@ -60,9 +62,18 @@ const fixPayloadAsync = async (payload: any) => {
     for (const content of newPayload.contents) {
       if (Array.isArray(content.parts)) {
         for (const part of content.parts) {
-          // 1. Fix inlineData MIME types
-          if (part.inlineData && part.inlineData.mimeType === 'application/octet-stream') {
-             part.inlineData.mimeType = 'text/plain';
+          // 1. Fix inlineData MIME types intelligently
+          if (part.inlineData && part.inlineData.mimeType) {
+             const mimeType = part.inlineData.mimeType;
+             const isOctetStream = mimeType === 'application/octet-stream';
+             const isApplication = APPLICATION_PREFIX.test(mimeType);
+             
+             if (isOctetStream || (isApplication && !JSON_PATTERN.test(mimeType) && !PDF_PATTERN.test(mimeType))) {
+                const hasNullBytes = NULL_BYTE_PATTERN.test(part.inlineData.data);
+                if (!hasNullBytes) {
+                   part.inlineData.mimeType = 'text/plain';
+                }
+             }
           }
 
           // 2. Fix fileData
@@ -83,7 +94,8 @@ const fixPayloadAsync = async (payload: any) => {
  */
 async function fetchWithRetry(url: string, options: RequestInit, signal: AbortSignal): Promise<Response> {
     let attempt = 0;
-    const maxRetries = 3; // Aggressive retry count for 500 errors
+    const maxRetries = 3;
+    const maxBackoffMs = 8000;
     
     while (true) {
         attempt++;
@@ -111,7 +123,7 @@ async function fetchWithRetry(url: string, options: RequestInit, signal: AbortSi
             console.warn(`Network error: ${e}. Retrying attempt ${attempt}/${maxRetries}...`);
         }
         
-        const delay = Math.pow(2, attempt) * 1000;
+        const delay = Math.min(Math.pow(2, attempt) * 1000, maxBackoffMs);
         await new Promise(resolve => setTimeout(resolve, delay));
     }
 }

@@ -10,11 +10,11 @@ import logging
 import os
 import re
 import shutil
+import string
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
-import string
 
 from app.core.config import settings
 from app.core.log_utils import Logger
@@ -54,6 +54,13 @@ class ChunkUploadState:
     size_bytes: int = 0
 
 
+@dataclass
+class UploadSession:
+    metadata: Dict[str, Any]
+    client_id: str  # 绑定到特定客户端，防止会话劫持
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 # ============================================================================
 # 文件管理器 (方案 B)
 # ============================================================================
@@ -69,36 +76,83 @@ class FileManager:
     4.  提供后台任务进行缓存清理 (TTL + LRU)。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """初始化文件管理器"""
         # 文件缓存目录
-        self.file_cache_dir = Path(settings.FILE_CACHE_DIR).resolve()
+        self.file_cache_dir: Path = Path(settings.FILE_CACHE_DIR).resolve()
         # 确保缓存目录在项目根目录之外，或者在 .gitignore 中，避免触发重载
-        # 这里我们假设 settings.FILE_CACHE_DIR 配置正确，或者我们可以在这里强制使用绝对路径
-        # 如果它是相对路径，确保它不在被监控的目录中，或者被忽略
         self.file_cache_dir.mkdir(parents=True, exist_ok=True)
 
         # 核心元数据存储 (sha256 -> FileCacheEntry)
         self.metadata_store: Dict[str, FileCacheEntry] = {}
         # 反向映射 (gemini_file_name -> sha256)
         self.reverse_mapping: Dict[str, str] = {}
-        # 临时上传会话 (session_id -> (metadata, created_at))
-        self.upload_sessions: Dict[str, Any] = {}
-        # 分块上传状态
+        # 临时上传会话 (session_id -> UploadSession)
+        self.upload_sessions: Dict[str, UploadSession] = {}
+        # 分块上传状态 (session_id -> ChunkUploadState)
         self.chunk_upload_states: Dict[str, ChunkUploadState] = {}
         # 记录被显式删除的 sha256，防止异步删除期间被再次引用
-        self.deleted_shas: set[str] = set()
+        self.deleted_shas: Set[str] = set()
         # 记录被删除的文件别名 (files/<id>、裸id 等) -> sha256
         self.deleted_alias_map: Dict[str, str] = {}
 
         Logger.event("INIT", "文件管理器(方案 B)初始化", cache_dir=str(self.file_cache_dir))
+
+    def start_upload_session(self, session_id: str, client_id: str, metadata: Optional[Dict[str, Any]] = None) -> UploadSession:
+        """创建绑定到特定客户端的上传会话，防止会话劫持。"""
+        session = UploadSession(metadata=dict(metadata or {}), client_id=client_id)
+        self.upload_sessions[session_id] = session
+        return session
+
+    def _extract_metadata_and_timestamp(self, session_data: Any) -> Tuple[Dict[str, Any], datetime]:
+        """从多种数据格式中提取元数据和时间戳"""
+        metadata: Dict[str, Any] = {}
+        created_at = datetime.now(timezone.utc)
+
+        if isinstance(session_data, dict):
+            metadata = dict(session_data.get("metadata") or session_data or {})
+            raw_created = session_data.get("created_at")
+        elif isinstance(session_data, tuple) and len(session_data) == 2:
+            metadata = dict(session_data[0] or {})
+            raw_created = session_data[1]
+        else:
+            raw_created = None
+
+        if isinstance(raw_created, datetime):
+            created_at = raw_created if raw_created.tzinfo else raw_created.replace(tzinfo=timezone.utc)
+
+        return metadata, created_at
+
+    def _normalize_upload_session(self, session_id: str, session_data: Any, client_id: Optional[str] = None) -> Optional[UploadSession]:
+        """规范化上传会话数据格式"""
+        if isinstance(session_data, UploadSession):
+            if client_id and session_data.client_id != client_id:
+                Logger.warning("会话客户端不匹配，拒绝访问", session_id=session_id)
+                return None
+            return session_data
+        if session_data is None:
+            return None
+
+        metadata, created_at = self._extract_metadata_and_timestamp(session_data)
+        bound_client_id = client_id or "unknown"
+        session = UploadSession(metadata=metadata, client_id=bound_client_id, created_at=created_at)
+        self.upload_sessions[session_id] = session
+        return session
+
+    def get_upload_session(self, session_id: str) -> Optional[UploadSession]:
+        session_data = self.upload_sessions.get(session_id)
+        return self._normalize_upload_session(session_id, session_data)
+
+    def get_upload_metadata(self, session_id: str) -> Dict[str, Any]:
+        session = self.get_upload_session(session_id)
+        return dict(session.metadata) if session else {}
 
     def _get_cache_path(self, sha256: str) -> Path:
         """根据 sha256 生成分层的文件缓存路径"""
         # 使用前4个字符创建两级子目录，避免单个目录下文件过多
         # 例如: d29a...f2 -> /.../file_cache/d2/9a/d29a...f2.bin
         if len(sha256) < 4:
-            raise ValueError("sha256 ahash must be at least 4 characters long")
+            raise ValueError("sha256 hash must be at least 4 characters long")
         sub_dir1 = sha256[:2]
         sub_dir2 = sha256[2:4]
         return self.file_cache_dir / sub_dir1 / sub_dir2 / f"{sha256}.bin"
@@ -106,26 +160,20 @@ class FileManager:
     async def save_stream_to_cache(
         self, stream: AsyncGenerator[bytes, None], filename: str
     ) -> Tuple[str, Path, int]:
-        """
-        将任何异步字节流保存到缓存，并同步计算 sha256 和大小。
+        """将异步字节流保存到缓存，使用后台线程执行阻塞 I/O。"""
 
-        Args:
-            stream: 任何异步字节生成器。
-            filename: 用于创建临时文件的原始文件名。
-
-        Returns:
-            一个元组 (sha256_hex, file_path, size_bytes)。
-        """
         sha256 = hashlib.sha256()
         size_bytes = 0
         temp_path = self.file_cache_dir / f"temp_{filename}"
 
         try:
-            with open(temp_path, "wb") as f:
+            with open(temp_path, "wb") as temp_file:
                 async for chunk in stream:
+                    if not chunk:
+                        continue
                     sha256.update(chunk)
-                    f.write(chunk)
                     size_bytes += len(chunk)
+                    await asyncio.to_thread(temp_file.write, chunk)
 
             sha256_hex = sha256.hexdigest()
             final_path = self._get_cache_path(sha256_hex)
@@ -134,7 +182,7 @@ class FileManager:
             final_path.parent.mkdir(parents=True, exist_ok=True)
 
             # 将临时文件移动到最终位置
-            shutil.move(temp_path, final_path)
+            await asyncio.to_thread(shutil.move, temp_path, final_path)
 
             Logger.event(
                 "FILE_CACHE_SAVE",
@@ -146,7 +194,7 @@ class FileManager:
             return sha256_hex, final_path, size_bytes
         finally:
             if os.path.exists(temp_path):
-                os.remove(temp_path)
+                await asyncio.to_thread(os.remove, temp_path)
 
     # ========================================================================
     # 分块上传管理
@@ -211,33 +259,31 @@ class FileManager:
     def _register_aliases(self, sha256: str, *aliases: str):
         """注册反向映射别名，兼容 files/<id> 及末尾裸 ID"""
         for alias in aliases:
-            if not alias:
-                continue
-            normalized = alias.strip()
-            if not normalized:
-                continue
-            self.reverse_mapping[normalized] = sha256
-            Logger.debug("注册文件别名", alias=normalized, sha256=sha256[:8])
-            if "/" in normalized:
-                tail = normalized.split("/")[-1]
-                if tail and tail != normalized:
-                    self.reverse_mapping[tail] = sha256
-                    Logger.debug("注册文件别名", alias=tail, sha256=sha256[:8])
+            for normalized in self._canonical_aliases(alias):
+                self.reverse_mapping[normalized] = sha256
+                Logger.debug("注册文件别名", alias=normalized, sha256=sha256[:8])
 
     def _remove_aliases(self, *aliases: str):
         """移除反向映射别名，同时移除裸 ID 映射"""
         for alias in aliases:
-            if not alias:
-                continue
-            normalized = alias.strip()
-            if not normalized:
-                continue
-            if self.reverse_mapping.pop(normalized, None):
-                Logger.debug("移除文件别名", alias=normalized)
-            if "/" in normalized:
-                tail = normalized.split("/")[-1]
-                if tail and tail != normalized and self.reverse_mapping.pop(tail, None):
-                    Logger.debug("移除文件别名", alias=tail)
+            for normalized in self._canonical_aliases(alias):
+                if self.reverse_mapping.pop(normalized, None):
+                    Logger.debug("移除文件别名", alias=normalized)
+
+    def _canonical_aliases(self, alias: Optional[str]) -> Set[str]:
+        """生成别名的所有规范形式，使用集合推导式优化"""
+        if not alias:
+            return set()
+        token = alias.strip()
+        if not token:
+            return set()
+        
+        variants = {token}
+        if "/" in token:
+            tail = token.rsplit("/", 1)[-1]
+            if tail and tail != token:
+                variants.add(tail)
+        return variants
 
     def extract_sha256_hex(self, remote_file: Dict[str, Any]) -> Optional[str]:
         """从远端文件响应中解析 sha256（支持 base64 或 hex 格式）"""
@@ -344,41 +390,58 @@ class FileManager:
         return entry
 
     def get_sha256_by_filename(self, file_name: str) -> Optional[str]:
-        """通过 gemini file name 或冗余 fileUri 获取 sha256"""
+        """通过 gemini file name 或冗余 fileUri 获取 sha256，优化查询流程"""
         if not file_name:
             return None
 
+        # 第一步：直接查询反向映射（O(1) 查询）
         mapped = self.reverse_mapping.get(file_name)
         if mapped:
             Logger.debug("命中文件别名", alias=file_name, sha256=mapped[:8])
             return mapped
 
-        # 处理完整 URL，例如 https://.../files/<id>
-        if "files/" in file_name:
-            suffix = file_name[file_name.index("files/") :]
-            mapped = self.reverse_mapping.get(suffix)
+        # 第二步：提取规范化形式并查询
+        normalized_forms = self._extract_normalized_forms(file_name)
+        for form in normalized_forms:
+            mapped = self.reverse_mapping.get(form)
             if mapped:
-                Logger.debug("命中文件别名", alias=suffix, sha256=mapped[:8])
+                Logger.debug("命中文件别名", alias=form, sha256=mapped[:8])
                 return mapped
 
-        # 兼容 fileUri 直接携带 sha256 的情况 (如 files/<sha256>)
-        candidate = file_name.split('/')[-1]
+        # 第三步：仅当前两步都失败时才进行全表扫描（带缓存）
+        result = self._fallback_lookup(file_name, normalized_forms)
+        if result:
+            return result
+
+        Logger.debug("文件别名未找到", alias=file_name)
+        return None
+
+    def _extract_normalized_forms(self, file_name: str) -> list[str]:
+        """提取可能的规范化形式"""
+        forms = []
+        normalized = file_name.strip().split(":download", 1)[0]
+        forms.append(normalized)
+        
+        if "files/" in normalized:
+            suffix = normalized[normalized.index("files/"):]
+            suffix = suffix.split(":download", 1)[0]
+            forms.append(suffix)
+            tail = suffix.split("files/", 1)[-1]
+            if tail:
+                forms.append(tail)
+        
+        # 检查是否为裸 sha256
+        candidate = file_name.split('/')[-1].split(":download", 1)[0]
         if len(candidate) == 64 and all(c in string.hexdigits for c in candidate):
             if candidate in self.metadata_store:
-                Logger.debug("命中裸 sha256", alias=file_name, sha256=candidate[:8])
-                return candidate
+                return [candidate]
+        
+        return forms
 
-        if file_name.startswith("files/"):
-            Logger.debug("文件别名未找到", alias=file_name)
-
-        # fallback: 扫描 replication_map，防止别名映射缺失
-        normalized = file_name.strip()
-        fallback_candidates = {normalized}
-        if "files/" in normalized:
-            fallback_candidates.add(normalized.split("files/", 1)[-1])
-        else:
-            fallback_candidates.add(f"files/{normalized}")
-
+    def _fallback_lookup(self, file_name: str, normalized_forms: list[str]) -> Optional[str]:
+        """回退查询：扫描 replication_map，仅在前两步失败时执行"""
+        fallback_candidates = set(normalized_forms)
+        
         for sha, entry in self.metadata_store.items():
             for data in entry.replication_map.values():
                 remote_name = data.get("name")
@@ -389,11 +452,11 @@ class FileManager:
                 uri = data.get("uri")
                 if uri and "files/" in uri:
                     uri_tail = uri.split("files/", 1)[-1]
-                    if uri_tail and (uri_tail in fallback_candidates):
+                    if uri_tail and uri_tail in fallback_candidates:
                         Logger.debug("通过 uri 找到文件", alias=file_name, sha256=sha[:8])
                         self._register_aliases(sha, uri, uri_tail)
                         return sha
-
+        
         return None
 
     def create_metadata_entry(
@@ -498,32 +561,29 @@ class FileManager:
 
         Logger.event("FILE_CACHE_DELETE", "文件已从缓存中删除", sha256=sha256)
 
+    def delete_entry(self, sha256: str):
+        """公开的缓存删除接口，供其他模块使用。"""
+        self._delete_entry(sha256)
+
     # ========================================================================
     # 删除标记管理
     # ========================================================================
 
     def _normalize_aliases_for_tombstone(self, alias: Optional[str]) -> Set[str]:
         """生成一组可用于 tombstone 的别名形式"""
-        if not alias:
-            return set()
         normalized_aliases: Set[str] = set()
-        token = alias.strip()
-        if not token:
-            return normalized_aliases
 
-        def _add(value: str):
-            value = value.strip()
-            if value:
-                normalized_aliases.add(value)
-
-        _add(token)
-        if "files/" in token:
-            tail = token.split("files/", 1)[-1]
-            if tail and tail != token:
-                _add(tail)
-                _add(f"files/{tail}")
-        else:
-            _add(f"files/{token}")
+        for token in self._canonical_aliases(alias):
+            if not token:
+                continue
+            normalized_aliases.add(token)
+            if token.startswith("files/"):
+                tail = token.split("files/", 1)[-1]
+                if tail and tail != token:
+                    normalized_aliases.add(tail)
+                    normalized_aliases.add(f"files/{tail}")
+            else:
+                normalized_aliases.add(f"files/{token}")
 
         return normalized_aliases
 
@@ -569,76 +629,91 @@ class FileManager:
         aliases = self._normalize_aliases_for_tombstone(name)
         return any(alias in self.deleted_alias_map for alias in aliases)
 
+    def _collect_ttl_expired_files(self, now: datetime) -> list[str]:
+        """收集所有 TTL 过期的文件"""
+        return [sha256 for sha256, entry in self.metadata_store.items()
+                if entry.gemini_file_expiration and now > entry.gemini_file_expiration]
+
+    def _collect_lru_candidates(self, now: datetime, exclude_shas: set) -> list[tuple]:
+        """收集 LRU 清理候选文件"""
+        candidates = []
+        for sha256, entry in self.metadata_store.items():
+            if sha256 not in exclude_shas:
+                candidates.append((entry.last_accessed_at, sha256, entry.size_bytes))
+        return candidates
+
+    def _select_lru_to_delete(self, lru_candidates: list, quota_bytes: int) -> set[str]:
+        """基于 LRU 策略选择要删除的文件"""
+        to_delete = set()
+        total_size = sum(size for _, _, size in lru_candidates)
+        
+        if total_size <= quota_bytes:
+            return to_delete
+        
+        Logger.info(f"LRU清理: 缓存超出配额 ({total_size / 1024 / 1024:.2f}MB > {quota_bytes / 1024 / 1024:.2f}MB)。")
+        lru_candidates.sort()
+        
+        for last_accessed, sha256, size_bytes in lru_candidates:
+            if total_size <= quota_bytes:
+                break
+            to_delete.add(sha256)
+            total_size -= size_bytes
+        
+        return to_delete
+
+    def _cleanup_expired_sessions(self, now: datetime) -> int:
+        """清理过期的上传会话，返回清理数量"""
+        expired_sessions = []
+        session_timeout = timedelta(hours=settings.SESSION_EXPIRATION_HOURS)
+        
+        for session_id, session_data in list(self.upload_sessions.items()):
+            session = session_data if isinstance(session_data, UploadSession) else self._normalize_upload_session(session_id, session_data)
+            if not session or (now - session.created_at) > session_timeout:
+                expired_sessions.append(session_id)
+        
+        for session_id in expired_sessions:
+            self.upload_sessions.pop(session_id, None)
+        
+        if expired_sessions:
+            Logger.info(f"清理 {len(expired_sessions)} 个过期的上传会话...")
+        
+        return len(expired_sessions)
+
     async def periodic_cleanup_task(self):
         """后台定期清理任务，结合 TTL 和 LRU 策略。"""
         while True:
             await asyncio.sleep(settings.FILE_CACHE_CLEANUP_INTERVAL)
             Logger.info("开始执行文件缓存清理任务...")
 
-            now = datetime.now(timezone.utc)
-            to_delete = set()
-
-            # 1. TTL 清理：标记所有已过期的文件
-            for sha256, entry in self.metadata_store.items():
-                if entry.gemini_file_expiration and now > entry.gemini_file_expiration:
-                    to_delete.add(sha256)
-
-            if to_delete:
-                Logger.info(f"TTL清理: 发现 {len(to_delete)} 个过期文件。")
-
-            # 2. LRU 清理：如果超出配额，继续标记最久未使用的文件
             try:
-                total_size_bytes = sum(
-                    entry.size_bytes for sha256, entry in self.metadata_store.items() if sha256 not in to_delete
-                )
+                now = datetime.now(timezone.utc)
+                to_delete = set()
+
+                # 1. TTL 清理
+                ttl_expired = self._collect_ttl_expired_files(now)
+                if ttl_expired:
+                    Logger.info(f"TTL清理: 发现 {len(ttl_expired)} 个过期文件。")
+                    to_delete.update(ttl_expired)
+
+                # 2. LRU 清理
                 quota_bytes = settings.FILE_CACHE_QUOTA_MB * 1024 * 1024
+                lru_candidates = self._collect_lru_candidates(now, to_delete)
+                lru_to_delete = self._select_lru_to_delete(lru_candidates, quota_bytes)
+                to_delete.update(lru_to_delete)
 
-                if total_size_bytes > quota_bytes:
-                    Logger.info(
-                        f"LRU清理: 缓存超出配额 ({(total_size_bytes / 1024 / 1024):.2f}MB > {settings.FILE_CACHE_QUOTA_MB}MB)。"
-                    )
-                    # 按最后访问时间升序排序 (最旧的在前)
-                    sorted_entries = sorted(
-                        [entry for sha256, entry in self.metadata_store.items() if sha256 not in to_delete],
-                        key=lambda x: x.last_accessed_at,
-                    )
+                # 3. 清理过期会话
+                self._cleanup_expired_sessions(now)
 
-                    for entry in sorted_entries:
-                        if total_size_bytes <= quota_bytes:
-                            break
-                        to_delete.add(entry.sha256)
-                        total_size_bytes -= entry.size_bytes
-            except Exception as e:
-                Logger.error("计算缓存大小时发生错误", exc=e)
-
-
-            # 3. 清理过期的上传会话
-            expired_sessions = []
-            session_timeout = timedelta(hours=1)  # 1小时超时
-            for session_id, session_data in list(self.upload_sessions.items()):
-                # session_data 可能是旧的格式(直接是metadata)或新的格式(metadata, created_at)
-                if isinstance(session_data, tuple) and len(session_data) == 2:
-                    metadata, created_at = session_data
-                    created_at = created_at.replace(tzinfo=timezone.utc)
-                    if now - created_at > session_timeout:
-                        expired_sessions.append(session_id)
+                # 4. 执行删除
+                if to_delete:
+                    Logger.info(f"准备删除 {len(to_delete)} 个缓存条目...")
+                    for sha256 in list(to_delete):
+                        self._delete_entry(sha256)
+                    Logger.info("缓存清理任务完成。")
                 else:
-                    # 旧格式，无法判断时间，直接清理超过1天的
-                    expired_sessions.append(session_id)
-
-            if expired_sessions:
-                Logger.info(f"清理 {len(expired_sessions)} 个过期的上传会话...")
-                for session_id in expired_sessions:
-                    self.upload_sessions.pop(session_id, None)
-
-            # 4. 执行删除
-            if to_delete:
-                Logger.info(f"准备删除 {len(to_delete)} 个缓存条目...")
-                for sha256 in list(to_delete):
-                    self._delete_entry(sha256)
-                Logger.info("缓存清理任务完成。")
-            else:
-                Logger.info("缓存状态正常，无需清理。")
+                    Logger.info("缓存状态正常，无需清理。")
+            except Exception as e:
+                Logger.error("缓存清理任务失败", exc=e)
 
     def cleanup_all_cache_files(self):
         """

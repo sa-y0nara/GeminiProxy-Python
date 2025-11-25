@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     FILE_CACHE_QUOTA_MB: int = 1024  # 缓存配额（MB）
     FILE_CACHE_CLEANUP_INTERVAL: int = 600  # 缓存清理任务间隔（秒）
     REMOTE_DOWNLOAD_TIMEOUT: int = 600  # 远程文件下载超时时间（秒）
+    MAX_BINARY_SIZE_MB: int = 512  # WebSocket 二进制传输最大大小（MB）
+    SESSION_EXPIRATION_HOURS: int = 1  # 上传会话过期时间（小时）
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"  # 忽略未定义的环境变量

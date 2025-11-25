@@ -111,22 +111,15 @@ export async function createMetadataOnlyFile(
 export async function uploadChunk(payload: UpdateFilePayload, backendUrl?: string): Promise<any> {
   let chunkBlob: Blob;
   
-  // 1. Acquire the chunk data (either from Base64 payload or via download)
-  if (payload.data_base64) {
-    try {
-      // Sanitize base64: remove all whitespace which might confuse the decoder
-      const cleanBase64 = payload.data_base64.replace(/\s/g, '');
-      
-      // OPTIMIZATION: Use native fetch to convert Base64 to Blob.
-      // This avoids creating huge strings and looping in JS, which is critical for 50MB+ files.
-      const res = await fetch(`data:application/octet-stream;base64,${cleanBase64}`);
-      chunkBlob = await res.blob();
-      
-    } catch (e) {
-      console.error("Failed to decode base64 chunk data", e);
-      throw new Error("Failed to decode base64 chunk data provided in WebSocket message.");
-    }
-  } else if (payload.chunk_download_url) {
+  // 1. Acquire the chunk data
+  // PRIORITY 1: Raw Binary Data (Protocol V2)
+  if (payload.data_bytes) {
+    // Directly wrap the Uint8Array in a Blob. No encoding/decoding cost.
+    console.debug(`[GeminiUpload] Processing binary chunk: ${payload.data_bytes.byteLength} bytes`);
+    chunkBlob = new Blob([payload.data_bytes]);
+  } 
+  // PRIORITY 2: Download URL (Pull model)
+  else if (payload.chunk_download_url) {
     let downloadUrl = payload.chunk_download_url;
     
     // Robustly handle relative URLs
@@ -160,7 +153,7 @@ export async function uploadChunk(payload: UpdateFilePayload, backendUrl?: strin
       throw new Error(`Failed to download chunk from backend (${downloadUrl}): ${msg}. Try using data_base64.`);
     }
   } else {
-    throw new Error("No chunk data provided (missing both data_base64 and chunk_download_url in payload).");
+    throw new Error("No chunk data provided (missing data_bytes or chunk_download_url in payload).");
   }
 
   // --- CRITICAL DATA INTEGRITY CHECKS ---

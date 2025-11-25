@@ -25,39 +25,62 @@ async function testGeminiConnection(): Promise<string> {
   return response.text;
 }
 
+// Command type constants to avoid string duplication
+enum CommandType {
+  // Model commands
+  LIST_MODELS = 'listModels',
+  GET_MODEL = 'getModel',
+  // Generation commands
+  GENERATE_CONTENT = 'generateContent',
+  STREAM_GENERATE_CONTENT = 'streamGenerateContent',
+  // File commands
+  CREATE_FILE = 'createFile',
+  INITIATE_RESUMABLE_UPLOAD = 'initiate_resumable_upload',
+  CREATE_FILE_METADATA = 'create_file_metadata',
+  CREATE_FILE_METADATA_ALT = 'createFileMetadata',
+  UPDATE_FILE = 'updateFile',
+  UPLOAD_CHUNK = 'upload_chunk',
+  UPLOAD_FILE_CHUNK = 'upload_file_chunk',
+  GET_FILE = 'getFile',
+  GET_FILE_ALT = 'get_file',
+  DELETE_FILE = 'deleteFile',
+  DELETE_FILE_ALT = 'delete_file',
+}
+
+// Create alias map to reduce duplication
+const COMMAND_ALIASES: Record<string, string> = {
+  [CommandType.CREATE_FILE_METADATA_ALT]: CommandType.CREATE_FILE_METADATA,
+  [CommandType.INITIATE_RESUMABLE_UPLOAD]: CommandType.CREATE_FILE,
+  [CommandType.UPDATE_FILE]: CommandType.UPLOAD_CHUNK,
+  [CommandType.UPLOAD_FILE_CHUNK]: CommandType.UPLOAD_CHUNK,
+  [CommandType.GET_FILE_ALT]: CommandType.GET_FILE,
+  [CommandType.DELETE_FILE_ALT]: CommandType.DELETE_FILE,
+};
+
+const COMMAND_HANDLERS: Record<string, Function> = {
+  [CommandType.LIST_MODELS]: (cmd: Command) => executeListModels(cmd.payload as ListModelsCommandPayload),
+  [CommandType.GET_MODEL]: (cmd: Command) => executeGetModel(cmd.payload as GetModelCommandPayload),
+  [CommandType.GENERATE_CONTENT]: (cmd: Command) => executeGenerateContent(cmd as generateContentCommand, activeRequests),
+  [CommandType.STREAM_GENERATE_CONTENT]: async (cmd: Command, sendResponse: (payload: unknown) => void) => 
+    await executeStreamGenerateContent(cmd as StreamGenerateContentCommand, sendResponse, activeRequests),
+  [CommandType.CREATE_FILE]: (cmd: Command) => initiateResumableUpload(cmd.payload as CreateFilePayload),
+  [CommandType.CREATE_FILE_METADATA]: (cmd: Command) => createMetadataOnlyFile(cmd.payload as CreateFilePayload),
+  [CommandType.UPLOAD_CHUNK]: (cmd: Command, _: unknown, backendUrl?: string) => uploadChunk(cmd.payload as UpdateFilePayload, backendUrl),
+  [CommandType.GET_FILE]: (cmd: Command) => getFile(cmd.payload as GetFilePayload),
+  [CommandType.DELETE_FILE]: (cmd: Command) => deleteFile(cmd.payload as DeleteFilePayload),
+};
+
 export const geminiExecutor = {
   execute: async (command: Command, sendResponse: (payload: unknown) => void, backendUrl?: string): Promise<any> => {
-    switch (command.type) {
-      case 'listModels':
-        return executeListModels(command.payload as ListModelsCommandPayload);
-      case 'getModel':
-        return executeGetModel(command.payload as GetModelCommandPayload);
-      case 'generateContent':
-        return executeGenerateContent(command as generateContentCommand, activeRequests);
-      case 'streamGenerateContent':
-        await executeStreamGenerateContent(command as StreamGenerateContentCommand, sendResponse, activeRequests);
-        return;
-      // File API Commands
-      case 'createFile':
-      case 'initiate_resumable_upload':
-        return initiateResumableUpload(command.payload as CreateFilePayload);
-      case 'create_file_metadata':
-      case 'createFileMetadata':
-        return createMetadataOnlyFile(command.payload as CreateFilePayload);
-      case 'updateFile':
-      case 'upload_chunk':
-      case 'upload_file_chunk':
-        return uploadChunk(command.payload as UpdateFilePayload, backendUrl);
-      case 'getFile':
-      case 'get_file':
-        return getFile(command.payload as GetFilePayload);
-      case 'deleteFile':
-      case 'delete_file':
-        return deleteFile(command.payload as DeleteFilePayload);
-      default:
-        const exhaustiveCheck: never = command;
-        throw new Error(`Unsupported command type: ${(exhaustiveCheck as any).type}`);
+    // 解析命令类型，支持别名
+    let commandType = command.type as string;
+    const canonicalType = COMMAND_ALIASES[commandType] || commandType;
+    
+    const handler = COMMAND_HANDLERS[canonicalType];
+    if (!handler) {
+      throw new Error(`Unsupported command type: ${command.type}`);
     }
+    return await handler(command, sendResponse, backendUrl);
   },
   
   // Cancel execution method
@@ -65,7 +88,6 @@ export const geminiExecutor = {
     const controller = activeRequests.get(requestId);
     if (controller) {
       controller.abort();
-      // No need to delete here, the finally block in executeStreamGenerateContent will handle it.
       console.log(`Aborted request ${requestId}`);
       return true;
     }

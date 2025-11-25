@@ -29,7 +29,7 @@ export type CreateFileCommand = BaseFileCommand<'createFile' | 'initiate_resumab
 export interface UpdateFilePayload {
   upload_url: string;
   chunk_download_url?: string;
-  data_base64?: string;
+  data_bytes?: Uint8Array; // Raw binary data from WebSocket
   upload_command: "upload" | "upload, finalize";
   upload_offset: number;
   content_length: number;

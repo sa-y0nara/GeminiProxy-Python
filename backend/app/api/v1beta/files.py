@@ -11,10 +11,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
-from urllib.parse import urlparse
-
-import httpx
+from typing import Optional
 from app.core import manager
 from app.core.config import settings
 from app.core.file_manager import file_manager
@@ -25,24 +22,25 @@ from app.schemas.gemini_files import (
     InitialUploadRequest,
     ListFilesPayload,
     ListFilesResponse,
-    UploadFromUrlRequest,
     UploadFileResponse,
 )
-from fastapi import (
-    APIRouter,
-    Body,
-    Depends,
-    File as FastAPIFile,
-    HTTPException,
-    Path as FastAPIPath,
-    Query,
-    Request,
-    Response,
-    UploadFile,
-    status,
-)
+from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
+
+FILENAME_RE = re.compile(r'filename[*]?=["\']?([^"\';\s]+)')
+
+
+def _parse_int_safe(value: Any, default: Optional[int] = None, label: str = "value") -> Optional[int]:
+    """安全地将值转换为整数，带验证和日志"""
+    if value is None:
+        return default
+    try:
+        result = int(value)
+        return result
+    except (TypeError, ValueError):
+        Logger.warning(f"{label} 无法转换为整数", value=value)
+        return default
 
 # ============================================================================
 # 路由器配置
@@ -52,52 +50,25 @@ router = APIRouter(tags=["Files"])
 upload_router = APIRouter(tags=["Files"])
 
 
-async def fetch_remote_file_metadata(
-    request: Request,
-    file_name: str,
-    parent_request_id: str,
-    reason: str = "verify",
-    preferred_client_id: Optional[str] = None,
-) -> Tuple[Optional[dict], Optional[str]]:
-    """
-    使用 files.get 命令验证远端的 Gemini 文件元数据。
-    返回 (file_dict, client_id)。
-    """
-    if not file_name:
-        return None, None
+def _extract_file_payload(response: Optional[dict]) -> Optional[dict]:
+    if isinstance(response, dict):
+        file_payload = response.get("file")
+        if isinstance(file_payload, dict):
+            return file_payload
+        return response
+    return None
 
-    verify_request_id = f"{parent_request_id}-{reason}"
-    try:
-        if preferred_client_id:
-            response = await manager.send_command_to_client(
-                client_id=preferred_client_id,
-                command_type="get_file",
-                payload={"file_name": file_name},
-                request_id=verify_request_id,
-            )
-            verify_client_id = preferred_client_id
-        else:
-            async with manager.monitored_proxy_request(verify_request_id, request) as verify_client_id:
-                response = await manager.proxy_request(
-                    command_type="get_file",
-                    payload={"file_name": file_name},
-                    request=request,
-                    request_id=verify_request_id,
-                )
-        remote_file = response.get("file") if isinstance(response, dict) else None
-        if not remote_file and isinstance(response, dict):
-            remote_file = response
-        if remote_file:
-            Logger.info(
-                "远程文件校验成功",
-                request_id=verify_request_id,
-                file_name=file_name,
-                mime=remote_file.get("mimeType"),
-            )
-        return remote_file, verify_client_id
-    except Exception as exc:
-        Logger.warning("远程文件校验失败", request_id=verify_request_id, file_name=file_name, exc=exc)
-        return None, None
+
+def _extract_request_metadata(
+    body: Optional[InitialUploadRequest],
+    *,
+    required: bool = False,
+) -> dict:
+    """统一处理上传入口处的 metadata 判空与提取。"""
+    metadata = body.file.model_dump(by_alias=True, exclude_none=True) if body and body.file else {}
+    if required and not metadata:
+        raise HTTPException(status_code=400, detail="file metadata is required")
+    return metadata
 
 
 def build_file_response(
@@ -118,14 +89,11 @@ def build_file_response(
     return File.model_validate(mapped_file_data).model_dump(by_alias=True, exclude_none=True)
 
 
-def build_final_upload_response(file_data: File | dict) -> JSONResponse:
+def build_final_upload_response(file_data: File | dict, request: Optional[Request] = None) -> JSONResponse:
     """
     构造带有 Google Upload 兼容头部的 JSON 响应
     """
-    if isinstance(file_data, File):
-        file_obj = file_data
-    else:
-        file_obj = File.model_validate(file_data)
+    file_obj = prepare_file_for_response(file_data, request)
 
     payload = UploadFileResponse(file=file_obj).model_dump(by_alias=True, exclude_none=True)
     return JSONResponse(
@@ -160,18 +128,9 @@ def enforce_size_consistency(
     check_header: bool = True,
 ):
     """校验声明的文件大小与实际写入大小是否一致"""
-    def _to_int(value, label):
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            Logger.warning(f"{label} 不是有效的整数", value=value, request_id=request_id)
-            return None
-
     declared_size = metadata.get("size_bytes") or metadata.get("sizeBytes")
-    declared_size_int = _to_int(declared_size, "sizeBytes")
-    header_size_int = _to_int(header_size, "Content-Length") if check_header else None
+    declared_size_int = _parse_int_safe(declared_size, label="sizeBytes")
+    header_size_int = _parse_int_safe(header_size, label="Content-Length") if check_header else None
 
     mismatch_errors = []
     if declared_size_int is not None and declared_size_int != actual_size:
@@ -200,6 +159,235 @@ def enforce_size_consistency(
         )
 
 
+def _determine_proxy_base_url(request: Optional[Request]) -> Optional[str]:
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    base = (settings.PROXY_BASE_URL or "").strip()
+    return base.rstrip("/") if base else None
+
+
+def _build_proxy_uris(base_url: str, file_name: str) -> tuple[str, str]:
+    normalized_name = file_name.lstrip("/")
+    if not normalized_name.startswith("files/"):
+        normalized_name = f"files/{normalized_name}"
+    metadata_uri = f"{base_url}/v1beta/{normalized_name}"
+    download_uri = f"{metadata_uri}:download"
+    return metadata_uri, download_uri
+
+
+def _first_non_empty(mapping: Optional[dict], *keys: str) -> Optional[str]:
+    if not mapping:
+        return None
+    for key in keys:
+        value = mapping.get(key)
+        if value:
+            return value
+    return None
+
+
+def _sanitize_filename_hint(filename_hint: Optional[str]) -> str:
+    """Sanitize filename to prevent directory traversal attacks."""
+    if not filename_hint:
+        return f"upload_{uuid.uuid4().hex}"
+    
+    # Remove path separators and parent directory references
+    sanitized = filename_hint.strip()
+    sanitized = sanitized.replace("\\", "_").replace("/", "_").replace("..", "_")
+    
+    # Remove leading dots
+    while sanitized.startswith("."):
+        sanitized = sanitized[1:]
+    
+    if not sanitized or len(sanitized) == 0:
+        return f"upload_{uuid.uuid4().hex}"
+    
+    return sanitized
+
+
+def _default_file_payload(entry, sha256: str, *, size_bytes: int) -> dict:
+    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+    fallback_name = f"files/{sha256}"
+    return {
+        "name": fallback_name,
+        "displayName": entry.original_filename or "untitled",
+        "mimeType": entry.mime_type or "application/octet-stream",
+        "sizeBytes": str(size_bytes),
+        "createTime": now,
+        "updateTime": now,
+        "sha256Hash": encode_sha256_base64(sha256) or sha256,
+        "uri": fallback_name,
+        "state": "ACTIVE",
+        "source": "UPLOADED",
+    }
+
+
+def prepare_file_for_response(file_data: File | dict, request: Optional[Request]) -> File:
+    file_obj = file_data if isinstance(file_data, File) else File.model_validate(file_data)
+    base_url = _determine_proxy_base_url(request)
+
+    if base_url:
+        metadata_uri, download_uri = _build_proxy_uris(base_url, file_obj.name)
+        file_obj = file_obj.model_copy(update={"uri": metadata_uri, "download_uri": download_uri})
+    elif not file_obj.download_uri and file_obj.uri:
+        file_obj = file_obj.model_copy(update={"download_uri": file_obj.uri})
+
+    return file_obj
+
+
+def parse_filename_from_headers(*headers: Optional[str]) -> Optional[str]:
+    """从若干 HTTP 头中提取文件名。"""
+    for header in headers:
+        if not header:
+            continue
+        match = FILENAME_RE.search(header)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _clear_upload_session(session_id: Optional[str]):
+    if session_id:
+        file_manager.upload_sessions.pop(session_id, None)
+
+
+def _ensure_not_deleted(name: str, sha256: Optional[str]):
+    """确保请求的文件未被标记为已删除。"""
+    if file_manager.is_name_marked_deleted(name):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+    if sha256 and file_manager.is_marked_deleted(sha256):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+
+
+def _ensure_unique_entry(sha256: str, request_id: str):
+    entry = file_manager.get_metadata_entry(sha256)
+    if entry and file_manager.is_marked_deleted(sha256):
+        Logger.info(
+            "检测到已删除文件重新上传，正在重置旧的元数据",
+            sha256=sha256[:8],
+            request_id=request_id,
+        )
+        file_manager.delete_entry(sha256)
+        return None
+    return entry
+
+
+def _resolve_filename_and_mime(
+    sha256: str,
+    metadata: dict,
+    filename_hint: Optional[str],
+    content_type_hint: Optional[str],
+    file_path: Path,
+    request_id: str,
+) -> tuple[str, str]:
+    normalized_hint = MimeUtils.normalize_filename(filename_hint)
+    metadata_filename = MimeUtils.normalize_filename(
+        _first_non_empty(metadata, "display_name", "displayName", "filename", "fileName")
+    )
+    valid_names = [
+        name
+        for name in [normalized_hint, metadata_filename]
+        if name and name.lower() not in {"untitled", "unknown", "unknown_file"}
+    ]
+    final_filename = valid_names[0] if valid_names else None
+
+    header_mime = None
+    if content_type_hint:
+        header_mime = content_type_hint.split(";")[0].strip().lower()
+        if header_mime == "application/octet-stream":
+            header_mime = None
+
+    metadata_mime = _first_non_empty(metadata, "mime_type", "mimeType")
+    if isinstance(metadata_mime, str):
+        metadata_mime = metadata_mime.strip().lower()
+
+    detected_mime = MimeUtils.detect_mime_type_from_content(file_path)
+    inferred_mime_from_name = MimeUtils.infer_mime_type(final_filename) if final_filename else None
+
+    candidate_mimes = [
+        header_mime,
+        metadata_mime,
+        detected_mime,
+        inferred_mime_from_name,
+    ]
+    final_mime = next((mime for mime in candidate_mimes if mime), "application/octet-stream")
+
+    if not final_filename:
+        final_filename = MimeUtils.build_fallback_filename(sha256, final_mime)
+        Logger.info(f"使用基于类型的临时文件名: {final_filename}", request_id=request_id)
+    else:
+        suffix = Path(final_filename).suffix
+        if not suffix:
+            extension = MimeUtils.guess_extension_from_mime(final_mime, default="")
+            if extension:
+                final_filename = f"{final_filename}{extension}"
+
+    return final_filename, final_mime
+
+
+def _build_local_offline_file(entry, sha256: str) -> dict:
+    return _default_file_payload(entry, sha256, size_bytes=entry.size_bytes)
+
+
+async def _sync_to_gemini(
+    *,
+    sha256: str,
+    entry,
+    request: Request,
+    request_id: str,
+    size_bytes: int,
+) -> dict:
+    gemini_file, client_id = await manager.upload_file_from_cache(sha256)
+    Logger.api_response(request_id, f"文件同步上传成功 | {client_id}")
+
+    remote_file, _, _ = await _fetch_remote_file_and_update_cache(
+        request=request,
+        file_name=gemini_file.get("name"),
+        request_id=request_id,
+        reason="get",
+        preferred_client_id=client_id,
+        allow_deleted=True,
+    )
+    if remote_file:
+        return build_file_response(remote_file, entry, size_bytes)
+
+    file_manager.update_replication_status(
+        sha256,
+        client_id,
+        "synced",
+        gemini_file,
+    )
+    return build_file_response(gemini_file, entry, size_bytes)
+
+
+def _handle_offline_fallback(*, sha256: str, entry, request_id: str) -> dict:
+    Logger.warning("没有可用的WebSocket客户端连接，但文件已保存到本地缓存", request_id=request_id)
+    try:
+        local_file_data = _build_local_offline_file(entry, sha256)
+        file_manager.update_replication_status(sha256, "local", "synced", local_file_data)
+        Logger.api_response(request_id, "文件已保存到本地缓存（离线模式）")
+        return local_file_data
+    except Exception as exc:
+        Logger.error("创建本地文件条目失败", exc=exc, request_id=request_id)
+        raise HTTPException(
+            status_code=503,
+            detail="No frontend clients available. Please ensure the browser client is connected.",
+        ) from exc
+
+
+async def persist_body_to_cache(request: Request, filename_hint: Optional[str]):
+    """将请求体保存到缓存，避免一次性读取全部内容。"""
+
+    body_stream = request.stream()
+
+    async def iterator():
+        async for chunk in body_stream:
+            if chunk:
+                yield chunk
+
+    temp_name = _sanitize_filename_hint(filename_hint)
+    return await file_manager.save_stream_to_cache(iterator(), temp_name)
+
+
 def map_frontend_response_to_file_model(frontend_file: Optional[dict], entry, size_bytes: int) -> dict:
     """
     将前端返回的文件对象映射到后端File模型期望的格式
@@ -215,41 +403,172 @@ def map_frontend_response_to_file_model(frontend_file: Optional[dict], entry, si
     # 确保我们有一个字典可供读取
     frontend_file = frontend_file or {}
 
-    # 创建当前时间戳
-    now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-
-    # 构建符合File模型的数据
-    fallback_name = f"files/{entry.sha256}"
+    base_payload = _default_file_payload(entry, entry.sha256, size_bytes=size_bytes)
+    fallback_name = base_payload["name"]
     sha_base64 = (
         frontend_file.get("sha256Hash")
         or frontend_file.get("sha256_hash")
-        or encode_sha256_base64(entry.sha256)
-        or entry.sha256
+        or base_payload["sha256Hash"]
     )
+
     mapped_file = {
+        **base_payload,
         "name": frontend_file.get("name") or fallback_name,
-        "displayName": entry.original_filename or "untitled",
-        "mimeType": entry.mime_type or "application/octet-stream",
         "sizeBytes": str(frontend_file.get("size", size_bytes)),
-        "createTime": now,
-        "updateTime": now,
-        "sha256Hash": sha_base64,
         "uri": frontend_file.get("uri") or fallback_name,
-        "state": "ACTIVE",  # 假设上传成功后状态为ACTIVE
-        "source": "UPLOADED"
+        "sha256Hash": sha_base64,
     }
 
-    # 如果前端提供了过期时间，使用它
+    if frontend_file.get("displayName"):
+        mapped_file["displayName"] = frontend_file["displayName"]
+
     if "expirationTime" in frontend_file:
         mapped_file["expirationTime"] = frontend_file["expirationTime"]
     elif entry.gemini_file_expiration:
         mapped_file["expirationTime"] = entry.gemini_file_expiration.isoformat().replace('+00:00', 'Z')
 
-    # 如果前端提供了下载URI，使用它
     if "downloadUri" in frontend_file:
         mapped_file["downloadUri"] = frontend_file["downloadUri"]
 
     return mapped_file
+
+
+def _resolve_cached_entry_or_404(
+    sha256: Optional[str],
+    *,
+    missing_identifier_detail: str = "File not found.",
+    missing_entry_detail: str = "File not available.",
+):
+    if not sha256:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=missing_identifier_detail)
+    entry = file_manager.get_metadata_entry(sha256)
+    if not entry or not entry.local_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=missing_entry_detail)
+    return entry
+
+
+def _build_download_response(
+    entry,
+    *,
+    download_name: Optional[str] = None,
+    include_filename: bool = True,
+) -> FileResponse:
+    """根据缓存条目生成 FileResponse，保持下载行为一致。"""
+    resolved_name = download_name or entry.original_filename or entry.local_path.name
+    response_kwargs = {"media_type": entry.mime_type}
+    if include_filename:
+        response_kwargs["filename"] = resolved_name
+    return FileResponse(entry.local_path, **response_kwargs)
+
+
+async def _fetch_remote_file_and_update_cache(
+    *,
+    request: Request,
+    file_name: str,
+    request_id: str,
+    reason: str,
+    preferred_client_id: Optional[str] = None,
+    allow_deleted: bool = False,
+) -> tuple[Optional[dict], Optional[str], bool]:
+    """Fetch remote metadata, update cache, and report deletion status."""
+    if not file_name:
+        return None, None, False
+
+    verify_request_id = f"{request_id}-{reason}"
+    try:
+        if preferred_client_id:
+            response = await manager.send_command_to_client(
+                client_id=preferred_client_id,
+                command_type="get_file",
+                payload={"file_name": file_name},
+                request_id=verify_request_id,
+            )
+            verify_client_id = preferred_client_id
+        else:
+            async with manager.monitored_proxy_request(verify_request_id, request) as verify_client_id:
+                response = await manager.proxy_request(
+                    command_type="get_file",
+                    payload={"file_name": file_name},
+                    request=request,
+                    request_id=verify_request_id,
+                )
+    except Exception as exc:
+        Logger.warning(
+            "远程文件校验失败",
+            request_id=verify_request_id,
+            file_name=file_name,
+            exc=exc,
+        )
+        return None, None, False
+
+    remote_file = _extract_file_payload(response)
+    if remote_file:
+        Logger.info(
+            "远程文件校验成功",
+            request_id=verify_request_id,
+            file_name=file_name,
+            mime=remote_file.get("mimeType"),
+        )
+    else:
+        return None, None, False
+
+    remote_sha = file_manager.extract_sha256_hex(remote_file)
+    if remote_sha and not allow_deleted and file_manager.is_marked_deleted(remote_sha):
+        return None, remote_sha, True
+
+    remote_entry = file_manager.ensure_remote_entry(remote_file)
+    cache_client_id = verify_client_id or preferred_client_id or "remote"
+    if remote_entry:
+        file_manager.update_replication_status(
+            remote_entry.sha256,
+            cache_client_id,
+            "synced",
+            remote_file,
+        )
+        file_manager.clear_deleted_flag(remote_entry.sha256)
+        remote_sha = remote_entry.sha256
+
+    return remote_file, remote_sha, False
+
+
+async def _prepare_remote_file(
+    *,
+    request: Request,
+    file_name: str,
+    request_id: str,
+    reason: str,
+    deleted_log_message: Optional[str] = None,
+    preferred_client_id: Optional[str] = None,
+    allow_deleted: bool = False,
+    require: bool = False,
+) -> Optional[File]:
+    """
+    获取远端文件并转为响应对象。
+    当 require=True 时，缺失会直接抛出 404，避免额外的样板。
+    """
+    remote_file, remote_sha, was_deleted = await _fetch_remote_file_and_update_cache(
+        request=request,
+        file_name=file_name,
+        request_id=request_id,
+        reason=reason,
+        preferred_client_id=preferred_client_id,
+        allow_deleted=allow_deleted,
+    )
+    if remote_file:
+        return prepare_file_for_response(remote_file, request)
+
+    if was_deleted and deleted_log_message:
+        Logger.info(
+            deleted_log_message,
+            request_id=request_id,
+            file_name=file_name,
+            sha256=(remote_sha[:8] if remote_sha else None),
+        )
+
+    if require or was_deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+
+    return None
 
 
 async def _ensure_valid_remote_entry(
@@ -270,20 +589,14 @@ async def _ensure_valid_remote_entry(
     ]
 
     for client_id, remote_name in candidates:
-        remote_file, verify_client_id = await fetch_remote_file_metadata(
-            request,
-            remote_name,
-            request_id,
+        remote_file, _, _ = await _fetch_remote_file_and_update_cache(
+            request=request,
+            file_name=remote_name,
+            request_id=request_id,
             reason="dedup-verify",
             preferred_client_id=client_id,
         )
         if remote_file:
-            file_manager.update_replication_status(
-                sha256,
-                verify_client_id or client_id,
-                "synced",
-                remote_file,
-            )
             return File.model_validate(remote_file)
 
     Logger.warning(
@@ -301,21 +614,22 @@ async def _ensure_valid_remote_entry(
             sha256=sha256[:8],
             client_id=client_id,
         )
-        remote_file, verify_client_id = await fetch_remote_file_metadata(
-            request,
-            gemini_file.get("name"),
-            request_id,
+        remote_file, _, _ = await _fetch_remote_file_and_update_cache(
+            request=request,
+            file_name=gemini_file.get("name"),
+            request_id=request_id,
             reason="dedup-rebuild",
             preferred_client_id=client_id,
         )
-        final_file = remote_file or gemini_file
+        if remote_file:
+            return File.model_validate(remote_file)
         file_manager.update_replication_status(
             sha256,
-            verify_client_id or client_id,
+            client_id,
             "synced",
-            final_file,
+            gemini_file,
         )
-        return File.model_validate(final_file)
+        return File.model_validate(gemini_file)
     except Exception as exc:
         Logger.error(
             "缓存文件重建失败，返回本地映射",
@@ -341,66 +655,23 @@ async def _process_cached_file_upload(
 ) -> JSONResponse:
     """共享的缓存文件上传处理逻辑"""
     metadata = metadata or {}
-    entry = file_manager.get_metadata_entry(sha256)
-    if entry and file_manager.is_marked_deleted(sha256):
-        Logger.info(
-            "检测到已删除文件重新上传，正在重置旧的元数据",
-            sha256=sha256[:8],
-            request_id=request_id,
-        )
-        file_manager._delete_entry(sha256)
-        entry = None
+    entry = _ensure_unique_entry(sha256, request_id)
 
     if entry:
         resolved_file = await _ensure_valid_remote_entry(entry, request=request, request_id=request_id)
         Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]})")
-        if session_id:
-            file_manager.upload_sessions.pop(session_id, None)
+        _clear_upload_session(session_id)
         file_manager.clear_deleted_flag(sha256)
-        return build_final_upload_response(resolved_file)
+        return build_final_upload_response(resolved_file, request=request)
 
-    normalized_hint = MimeUtils.normalize_filename(filename_hint)
-    metadata_filename = MimeUtils.normalize_filename(
-        metadata.get("display_name")
-        or metadata.get("displayName")
-        or metadata.get("filename")
-        or metadata.get("fileName")
+    final_filename, final_mime = _resolve_filename_and_mime(
+        sha256,
+        metadata,
+        filename_hint,
+        content_type_hint,
+        file_path,
+        request_id,
     )
-    valid_names = [
-        name for name in [normalized_hint, metadata_filename] if name and name.lower() not in {"untitled", "unknown", "unknown_file"}
-    ]
-    final_filename = valid_names[0] if valid_names else None
-
-    header_mime = None
-    if content_type_hint:
-        header_mime = content_type_hint.split(";")[0].strip().lower()
-        if header_mime == "application/octet-stream":
-            header_mime = None
-
-    metadata_mime = metadata.get("mime_type") or metadata.get("mimeType")
-    if isinstance(metadata_mime, str):
-        metadata_mime = metadata_mime.strip().lower()
-
-    detected_mime = MimeUtils.detect_mime_type_from_content(file_path)
-    inferred_mime_from_name = MimeUtils.infer_mime_type(final_filename) if final_filename else None
-
-    candidate_mimes = [
-        header_mime,
-        metadata_mime,
-        detected_mime,
-        inferred_mime_from_name,
-    ]
-    final_mime = next((mime for mime in candidate_mimes if mime), "application/octet-stream")
-
-    if not final_filename:
-        final_filename = MimeUtils.build_fallback_filename(sha256, final_mime)
-        Logger.info(f"使用基于类型的临时文件名: {final_filename}", request_id=request_id)
-    else:
-        suffix = Path(final_filename).suffix
-        if not suffix:
-            extension = MimeUtils.guess_extension_from_mime(final_mime, default="")
-            if extension:
-                final_filename = f"{final_filename}{extension}"
 
     entry = file_manager.create_metadata_entry(
         sha256=sha256,
@@ -416,67 +687,111 @@ async def _process_cached_file_upload(
     )
 
     try:
-        gemini_file, client_id = await manager.upload_file_from_cache(sha256)
-        Logger.api_response(request_id, f"文件同步上传成功 | {client_id}")
-
-        remote_file, verify_client_id = await fetch_remote_file_metadata(
-            request,
-            gemini_file.get("name"),
-            request_id,
-            reason="get",
-            preferred_client_id=client_id,
+        file_data = await _sync_to_gemini(
+            sha256=sha256,
+            entry=entry,
+            request=request,
+            request_id=request_id,
+            size_bytes=size_bytes,
         )
-        if remote_file:
-            file_manager.update_replication_status(
-                sha256,
-                verify_client_id or client_id,
-                "synced",
-                remote_file,
+    except HTTPException as exc:
+        if exc.status_code == 503:
+            file_data = _handle_offline_fallback(
+                sha256=sha256,
+                entry=entry,
+                request_id=request_id,
             )
-            gemini_file = remote_file
-
-        if session_id:
-            file_manager.upload_sessions.pop(session_id, None)
-
-        file_data = build_file_response(gemini_file, entry, size_bytes)
-        file_manager.clear_deleted_flag(sha256)
-        return build_final_upload_response(file_data)
-    except HTTPException as e:
-        if e.status_code == 503:
-            Logger.warning("没有可用的WebSocket客户端连接，但文件已保存到本地缓存", request_id=request_id)
-            try:
-                local_file_data = {
-                    "name": f"files/{sha256}",
-                    "displayName": entry.original_filename or "untitled",
-                    "mimeType": entry.mime_type or "application/octet-stream",
-                    "sizeBytes": str(entry.size_bytes),
-                    "createTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                    "updateTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                    "sha256Hash": encode_sha256_base64(sha256) or sha256,
-                    "uri": f"files/{sha256}",
-                    "state": "ACTIVE",
-                    "source": "UPLOADED",
-                }
-
-                file_manager.update_replication_status(sha256, "local", "synced", local_file_data)
-                Logger.api_response(request_id, "文件已保存到本地缓存（离线模式）")
-
-                if session_id:
-                    file_manager.upload_sessions.pop(session_id, None)
-
-                file_manager.clear_deleted_flag(sha256)
-                return build_final_upload_response(local_file_data)
-            except Exception as local_error:
-                Logger.error("创建本地文件条目失败", exc=local_error, request_id=request_id)
-
-            raise HTTPException(
-                status_code=503,
-                detail="No frontend clients available. Please ensure the browser client is connected.",
-            )
-        raise
+        else:
+            raise
     except Exception as exc:
         Logger.error("上传过程中发生未预期的错误", exc=exc)
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(exc)}")
+    finally:
+        _clear_upload_session(session_id)
+
+    file_manager.clear_deleted_flag(sha256)
+    return build_final_upload_response(file_data, request=request)
+
+
+def _parse_upload_commands(header_value: Optional[str]) -> set[str]:
+    if not header_value:
+        return set()
+    return {token.strip().lower() for token in header_value.split(",") if token.strip()}
+
+
+async def _handle_chunked_upload(
+    *,
+    request: Request,
+    session_id: str,
+    metadata: dict,
+    request_id: str,
+    upload_offset_header: Optional[str],
+    finalize_requested: bool,
+) -> Response | tuple[str, Path, int]:
+    try:
+        upload_offset_int = int(upload_offset_header or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid X-Goog-Upload-Offset header.")
+
+    chunk_data = await request.body()
+    try:
+        new_offset = file_manager.append_chunk_data(session_id, chunk_data, upload_offset_int)
+    except ValueError as offset_error:
+        file_manager.discard_chunk_upload(session_id)
+        file_manager.upload_sessions.pop(session_id, None)
+        raise HTTPException(status_code=400, detail=str(offset_error))
+
+    if not finalize_requested:
+        return Response(
+            status_code=308,
+            headers={
+                "X-Goog-Upload-Status": "active",
+                "X-Goog-Upload-Offset": str(new_offset),
+            },
+        )
+
+    try:
+        sha256, file_path, size_bytes = file_manager.finalize_chunk_upload(session_id)
+    except ValueError as finalize_error:
+        file_manager.upload_sessions.pop(session_id, None)
+        raise HTTPException(status_code=400, detail=str(finalize_error))
+
+    enforce_size_consistency(
+        metadata,
+        size_bytes,
+        header_size=None,
+        request_id=request_id,
+        session_id=session_id,
+        file_path=file_path,
+        check_header=False,
+    )
+    return sha256, file_path, size_bytes
+
+
+async def _handle_stream_upload(
+    *,
+    request: Request,
+    filename_hint: Optional[str],
+    metadata: dict,
+    request_id: str,
+    session_id: str,
+):
+    try:
+        sha256, file_path, size_bytes = await persist_body_to_cache(request, filename_hint)
+    except Exception as exc:
+        Logger.error("保存文件到缓存失败", exc=exc)
+        raise HTTPException(status_code=500, detail="Failed to save file to cache.") from exc
+
+    enforce_size_consistency(
+        metadata,
+        size_bytes,
+        header_size=request.headers.get("content-length"),
+        request_id=request_id,
+        session_id=session_id,
+        file_path=file_path,
+        check_header=True,
+    )
+    return sha256, file_path, size_bytes
 
 
 # ============================================================================
@@ -490,14 +805,12 @@ async def create_file(
     body: InitialUploadRequest = Body(...),
 ):
     """
-    初始化一个模拟的可续传上传会话。
+    初始化一个模拟的可续传上传会话，绑定到客户端以防止会话劫持。
     """
     session_id = str(uuid.uuid4())
-    metadata = body.file.model_dump(by_alias=True, exclude_none=True) if body and body.file else {}
-    file_manager.upload_sessions[session_id] = {
-        "metadata": metadata,
-        "created_at": datetime.now(timezone.utc),
-    }
+    client_id = request.headers.get("X-Client-ID") or request.headers.get("x-client-id") or "anonymous"
+    metadata = _extract_request_metadata(body)
+    file_manager.start_upload_session(session_id, client_id, metadata)
 
     # 注意这里的路径，它指向 v1beta router 下的一个新端点
     proxy_upload_url = f"{settings.PROXY_BASE_URL}/v1beta/files/upload/{session_id}"
@@ -506,6 +819,7 @@ async def create_file(
         headers={
             "X-Goog-Upload-URL": proxy_upload_url,
             "X-Goog-Upload-Status": "active",
+            "X-Client-ID": client_id,  # 返回客户端 ID 便于验证
         },
     )
 
@@ -521,9 +835,7 @@ async def create_file_metadata_only(
 ):
     """处理 metadata-only 文件创建请求"""
     request_id = str(uuid.uuid4())
-    metadata = body.file.model_dump(by_alias=True, exclude_none=True) if body and body.file else {}
-    if not metadata:
-        raise HTTPException(status_code=400, detail="file metadata is required")
+    metadata = _extract_request_metadata(body, required=True)
 
     Logger.api_request(request_id, "文件 metadata-only 创建")
     payload = {"metadata": {"file": metadata}}
@@ -535,9 +847,7 @@ async def create_file_metadata_only(
             request_id=request_id,
         )
 
-    remote_file = response_data.get("file") if isinstance(response_data, dict) else None
-    if not remote_file and isinstance(response_data, dict):
-        remote_file = response_data
+    remote_file = _extract_file_payload(response_data)
     if not isinstance(remote_file, dict):
         raise HTTPException(status_code=502, detail="Invalid response from frontend client")
 
@@ -547,7 +857,7 @@ async def create_file_metadata_only(
         file_manager.clear_deleted_flag(entry.sha256)
 
     Logger.api_response(request_id, "metadata-only 文件创建成功")
-    return build_final_upload_response(remote_file)
+    return build_final_upload_response(remote_file, request=request)
 
 
 @router.post(
@@ -563,120 +873,65 @@ async def resumable_upload(
     接收文件内容，并触发完整的方案 B 上传/同步逻辑。
     支持自动重试机制以处理临时连接问题。
     """
-    if session_id not in file_manager.upload_sessions:
+    # 提取客户端 ID 用于会话验证，防止会话劫持
+    client_id = request.headers.get("X-Client-ID") or request.headers.get("x-client-id")
+    
+    session = file_manager.get_upload_session(session_id)
+    if not session:
         raise HTTPException(status_code=404, detail="Upload session not found.")
+    
+    # 验证会话绑定到正确的客户端
+    if client_id and session.client_id != client_id:
+        Logger.warning(
+            "会话客户端验证失败，拒绝访问",
+            session_id=session_id,
+            expected_client=session.client_id,
+            provided_client=client_id,
+        )
+        raise HTTPException(status_code=403, detail="Session client mismatch.")
 
-    session_data = file_manager.upload_sessions[session_id]
-    metadata = {}
-    if isinstance(session_data, dict):
-        metadata = session_data.get("metadata", {})
-    elif isinstance(session_data, tuple) and len(session_data) == 2:
-        metadata = session_data[0]
-    else:
-        metadata = session_data or {}
-    filename = metadata.get("display_name", "untitled")
+    metadata = dict(session.metadata or {})
 
-    # --- 从这里开始，是我们之前实现的方案 B 核心逻辑 ---
+    filename_hint = _first_non_empty(metadata, "display_name", "displayName", "filename", "fileName") or "untitled"
+
     request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"文件内容上传 | {filename}")
+    Logger.api_request(request_id, f"文件内容上传 | {filename_hint}")
 
-    # 记录关键请求信息
     content_type = request.headers.get("content-type", "unknown")
     content_length = request.headers.get("content-length", "unknown")
     Logger.info(f"文件上传请求 - MIME: {content_type}, 大小: {content_length}", request_id=request_id)
 
-    # 尝试从请求头中获取文件名信息
-    content_disposition = request.headers.get('content-disposition', '')
-    if content_disposition:
-        # 从 Content-Disposition 中解析文件名
+    content_disposition = request.headers.get("content-disposition", "")
+    header_filename = parse_filename_from_headers(content_disposition)
+    if header_filename:
+        filename_hint = header_filename
+        Logger.info(f"从请求头中提取文件名: {filename_hint}", request_id=request_id)
 
-        filename_match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', content_disposition)
-        if filename_match:
-            filename = filename_match.group(1)
-            Logger.info(f"从请求头中提取文件名: {filename}", request_id=request_id)
-
-    # 跳过其他请求头信息处理
-
-    upload_command_header = request.headers.get("x-goog-upload-command", "")
+    command_tokens = _parse_upload_commands(request.headers.get("x-goog-upload-command"))
     upload_offset_header = request.headers.get("x-goog-upload-offset")
-    command_tokens = {token.strip().lower() for token in upload_command_header.split(",") if token.strip()}
     is_chunked_upload = bool(command_tokens) or upload_offset_header is not None
     finalize_requested = "finalize" in command_tokens
 
     if is_chunked_upload:
-        try:
-            upload_offset_int = int(upload_offset_header or 0)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid X-Goog-Upload-Offset header.")
-
-        chunk_data = await request.body()
-        try:
-            new_offset = file_manager.append_chunk_data(session_id, chunk_data, upload_offset_int)
-        except ValueError as offset_error:
-            file_manager.discard_chunk_upload(session_id)
-            file_manager.upload_sessions.pop(session_id, None)
-            raise HTTPException(status_code=400, detail=str(offset_error))
-
-        if not finalize_requested:
-            return Response(
-                status_code=308,
-                headers={
-                    "X-Goog-Upload-Status": "active",
-                    "X-Goog-Upload-Offset": str(new_offset),
-                },
-            )
-
-        try:
-            sha256, file_path, size_bytes = file_manager.finalize_chunk_upload(session_id)
-        except ValueError as finalize_error:
-            file_manager.upload_sessions.pop(session_id, None)
-            raise HTTPException(status_code=400, detail=str(finalize_error))
-
-        enforce_size_consistency(
-            metadata,
-            size_bytes,
-            header_size=None,
-            request_id=request_id,
+        chunk_result = await _handle_chunked_upload(
+            request=request,
             session_id=session_id,
-            file_path=file_path,
-            check_header=False,
+            metadata=metadata,
+            request_id=request_id,
+            upload_offset_header=upload_offset_header,
+            finalize_requested=finalize_requested,
         )
+        if isinstance(chunk_result, Response):
+            return chunk_result
+        sha256, file_path, size_bytes = chunk_result
     else:
-        try:
-            body_stream = request.stream()
-
-            async def file_stream():
-                async for chunk in body_stream:
-                    yield chunk
-
-            sha256, file_path, size_bytes = await file_manager.save_stream_to_cache(
-                file_stream(), filename
-            )
-        except Exception as e:
-            Logger.error("保存文件到缓存失败", exc=e)
-            raise HTTPException(status_code=500, detail="Failed to save file to cache.")
-
-        enforce_size_consistency(
-            metadata,
-            size_bytes,
-            header_size=request.headers.get("content-length"),
+        sha256, file_path, size_bytes = await _handle_stream_upload(
+            request=request,
+            filename_hint=filename_hint,
+            metadata=metadata,
             request_id=request_id,
             session_id=session_id,
-            file_path=file_path,
-            check_header=True,
         )
-
-    # 统一处理缓存文件
-    inferred_name = filename
-    if not inferred_name or inferred_name == "untitled":
-        content_disposition = request.headers.get("content-disposition", "")
-        if content_disposition:
-
-
-            filename_match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', content_disposition)
-            if filename_match:
-                inferred_name = filename_match.group(1)
-                Logger.info(f"从请求头推断文件名: {inferred_name}", request_id=request_id)
 
     return await _process_cached_file_upload(
         request=request,
@@ -686,81 +941,32 @@ async def resumable_upload(
         metadata=metadata,
         request_id=request_id,
         session_id=session_id,
-        filename_hint=inferred_name,
+        filename_hint=filename_hint,
         content_type_hint=request.headers.get("content-type"),
     )
 
 
-@router.post(
-    "/files:uploadFromUrl",
-    response_model=UploadFileResponse,
-    name="files.uploadFromUrl",
+# ============================================================================
+# 文件下载端点
+# ============================================================================
+
+
+@router.get(
+    "/files/{name:path}:download",
+    name="files.download",
 )
-async def upload_file_from_url(
-    request: Request,
-    payload: UploadFromUrlRequest,
-):
-    """
-    通过远程 URL 下载文件并上传到 Gemini（方案 B）。
-    """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"远程文件上传 | {payload.url}")
-
-    metadata = payload.file.model_dump(by_alias=True, exclude_none=True) if payload.file else {}
-    headers = payload.headers or {}
-
-    url_path_name = Path(urlparse(str(payload.url)).path).name or "remote_file"
-    filename_hint = (
-        metadata.get("display_name")
-        or metadata.get("displayName")
-        or url_path_name
-        or f"remote_{request_id[:8]}"
+async def download_file(name: str):
+    """对外提供的文件内容下载端点。"""
+    sha256 = file_manager.get_sha256_by_filename(name)
+    entry = _resolve_cached_entry_or_404(
+        sha256,
+        missing_identifier_detail="File not found.",
+        missing_entry_detail="File not available.",
     )
 
-    effective_filename = filename_hint or url_path_name
-    content_type_hint: Optional[str] = None
-
-    try:
-        async with httpx.AsyncClient(timeout=settings.REMOTE_DOWNLOAD_TIMEOUT) as client:
-            async with client.stream("GET", str(payload.url), headers=headers) as response:
-                response.raise_for_status()
-                content_type_hint = response.headers.get("content-type")
-                disposition = response.headers.get("content-disposition", "")
-
-                remote_filename = None
-                if disposition:
-                    filename_match = re.search(r'filename[*]?=["\']?([^"\';\s]+)', disposition)
-                    if filename_match:
-                        remote_filename = filename_match.group(1)
-
-                effective_filename = remote_filename or filename_hint or url_path_name or effective_filename
-
-                async def remote_stream():
-                    async for chunk in response.aiter_bytes():
-                        if chunk:
-                            yield chunk
-
-                sha256, file_path, size_bytes = await file_manager.save_stream_to_cache(remote_stream(), effective_filename)
-    except httpx.HTTPError as exc:
-        Logger.error("下载远程文件失败", exc=exc, url=str(payload.url), request_id=request_id)
-        raise HTTPException(status_code=502, detail=f"Failed to download remote file: {exc}") from exc
-
-    return await _process_cached_file_upload(
-        request=request,
-        sha256=sha256,
-        file_path=file_path,
-        size_bytes=size_bytes,
-        metadata=metadata,
-        request_id=request_id,
-        session_id=None,
-        filename_hint=effective_filename,
-        content_type_hint=content_type_hint,
-    )
-
-
-# ============================================================================
-# 内部下载端点 (供 WebSocket 客户端使用)
-# ============================================================================
+    Logger.event("PUBLIC_DOWNLOAD", "用户下载文件", sha256=sha256[:8])
+    download_name = entry.original_filename or name.split("/")[-1]
+    return _build_download_response(entry, download_name=download_name)
 
 
 @router.get(
@@ -772,12 +978,14 @@ async def internal_download_file(sha256: str, token: str):
     供 WebSocket 客户端下载文件内容以进行上传。
     TODO: 需要实现安全的令牌验证机制。
     """
-    entry = file_manager.get_metadata_entry(sha256)
-    if not entry or not entry.local_path.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found in cache.")
+    entry = _resolve_cached_entry_or_404(
+        sha256,
+        missing_identifier_detail="File not found in cache.",
+        missing_entry_detail="File not found in cache.",
+    )
 
     Logger.event("INTERNAL_DOWNLOAD", "客户端正在下载文件", sha256=sha256[:8])
-    return FileResponse(entry.local_path, media_type=entry.mime_type)
+    return _build_download_response(entry, include_filename=False)
 
 
 # ============================================================================
@@ -790,37 +998,45 @@ async def internal_download_file(sha256: str, token: str):
     response_model=ListFilesResponse,
     name="files.list",
 )
-async def list_files(params: ListFilesPayload = Depends()):
+async def list_files(request: Request, params: ListFilesPayload = Depends()):
     """从后端缓存中列出所有文件。"""
-    all_valid_files = []
-    # 按创建时间倒序收集所有有效的、已同步的文件副本
-    sorted_entries = sorted(file_manager.metadata_store.values(), key=lambda e: e.created_at, reverse=True)
+    def _iter_synced_files():
+        """迭代所有已同步的文件，按创建时间降序"""
+        sorted_entries = sorted(
+            file_manager.metadata_store.values(),
+            key=lambda e: e.created_at,
+            reverse=True,
+        )
+        for entry in sorted_entries:
+            replica = next(
+                (
+                    data
+                    for data in entry.replication_map.values()
+                    if data.get("status") == "synced" and data.get("name")
+                ),
+                None,
+            )
+            if not replica:
+                continue
+            try:
+                yield File.model_validate(replica)
+            except Exception as exc:
+                Logger.warning(f"复制数据不完整，跳过: {exc}")
 
-    for entry in sorted_entries:
-        for data in entry.replication_map.values():
-            if data.get("status") == "synced" and "name" in data:
-                try:
-                    file_obj = File.model_validate(data)
-                    all_valid_files.append(file_obj)
-                    break  # 每个sha256只取一个代表
-                except Exception as e:
-                    Logger.warning(f"复制数据不完整，跳过: {e}")
-                    continue
+    all_valid_files = list(_iter_synced_files())
 
     # 实现分页
-    start_index = 0
-    if params.page_token:
-        try:
-            start_index = int(params.page_token)
-        except ValueError:
-            pass  # 无效token，从头开始
+    start_index = _parse_int_safe(params.page_token, default=0, label="page_token")
+    if start_index < 0:
+        start_index = 0
 
     end_index = start_index + params.page_size
     paginated_files = all_valid_files[start_index:end_index]
+    prepared_files = [prepare_file_for_response(file_obj, request) for file_obj in paginated_files]
 
     next_page_token = str(end_index) if end_index < len(all_valid_files) else None
 
-    return ListFilesResponse(files=paginated_files, next_page_token=next_page_token)
+    return ListFilesResponse(files=prepared_files, next_page_token=next_page_token)
 
 
 @router.get(
@@ -835,90 +1051,46 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
     entry = file_manager.get_metadata_entry(sha256) if sha256 else None
 
     if not sha256 or not entry:
-        if file_manager.is_name_marked_deleted(name) or file_manager.is_marked_deleted(sha256):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-        remote_file, verify_client_id = await fetch_remote_file_metadata(
-            request,
-            name,
-            request_id,
+        _ensure_not_deleted(name, sha256)
+        return await _prepare_remote_file(
+            request=request,
+            file_name=name,
+            request_id=request_id,
             reason="get-miss",
+            deleted_log_message="请求访问已删除文件，忽略远程返回",
+            require=True,
         )
-        if remote_file:
-            remote_sha = file_manager.extract_sha256_hex(remote_file)
-            if file_manager.is_marked_deleted(remote_sha):
-                Logger.info(
-                    "请求访问已删除文件，忽略远程返回",
-                    request_id=request_id,
-                    file_name=name,
-                    sha256=(remote_sha[:8] if remote_sha else None),
-                )
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-            remote_entry = file_manager.ensure_remote_entry(remote_file)
-            if remote_entry:
-                file_manager.update_replication_status(
-                    remote_entry.sha256,
-                    verify_client_id or "remote",
-                    "synced",
-                    remote_file,
-                )
-            return File.model_validate(remote_file)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+
+    _ensure_not_deleted(name, sha256)
 
     if verify_remote:
-        if file_manager.is_marked_deleted(sha256):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-        remote_file, verify_client_id = await fetch_remote_file_metadata(
-            request,
-            name,
-            request_id,
+        remote_file = await _prepare_remote_file(
+            request=request,
+            file_name=name,
+            request_id=request_id,
             reason="get",
+            deleted_log_message="请求访问已删除文件，忽略远程返回",
         )
         if remote_file:
-            file_manager.update_replication_status(
-                sha256,
-                verify_client_id or "remote",
-                "synced",
-                remote_file,
-            )
-            return File.model_validate(remote_file)
+            return remote_file
         Logger.warning("远程校验失败，返回本地缓存", request_id=request_id, file_name=name)
 
-    if entry:
-        for data in entry.replication_map.values():
-            if data.get("name") == name and data.get("status") == "synced":
-                try:
-                    return File.model_validate(data)
-                except Exception as e:
-                    Logger.warning(f"文件数据不完整，无法返回: {e}")
-                    continue
+    for data in entry.replication_map.values():
+        if data.get("name") == name and data.get("status") == "synced":
+            try:
+                return prepare_file_for_response(data, request)
+            except Exception as exc:
+                Logger.warning(f"文件数据不完整，无法返回: {exc}")
+                continue
 
-    remote_file, verify_client_id = await fetch_remote_file_metadata(
-        request,
-        name,
-        request_id,
+    return await _prepare_remote_file(
+        request=request,
+        file_name=name,
+        request_id=request_id,
         reason="get-refresh",
+        deleted_log_message="刷新请求命中已删除文件，忽略远程返回",
+        require=True,
     )
-    if remote_file:
-        remote_sha = file_manager.extract_sha256_hex(remote_file)
-        if file_manager.is_marked_deleted(remote_sha):
-            Logger.info(
-                "刷新请求命中已删除文件，忽略远程返回",
-                request_id=request_id,
-                file_name=name,
-                sha256=(remote_sha[:8] if remote_sha else None),
-            )
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-        remote_entry = file_manager.ensure_remote_entry(remote_file)
-        if remote_entry:
-            file_manager.update_replication_status(
-                remote_entry.sha256,
-                verify_client_id or "remote",
-                "synced",
-                remote_file,
-            )
-        return File.model_validate(remote_file)
-
-    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
 
 
 @router.delete(
@@ -935,20 +1107,20 @@ async def delete_file(request: Request, name: str):
 
     sha256 = file_manager.get_sha256_by_filename(name)
     if not sha256:
-        # 如果文件在本地不存在，也直接返回成功，保持幂等性
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
         return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
-    alias_candidates = {name}
     entry = file_manager.get_metadata_entry(sha256)
+    alias_candidates = {name}
     if entry:
-        for data in entry.replication_map.values():
-            remote_name = data.get("name")
-            if remote_name:
-                alias_candidates.add(remote_name)
-            uri = data.get("uri")
-            if uri:
-                alias_candidates.add(uri)
+        alias_candidates.update(
+            {
+                alias
+                for data in entry.replication_map.values()
+                for alias in (data.get("name"), data.get("uri"))
+                if alias
+            }
+        )
     file_manager.mark_deleted(sha256, alias_candidates)
     if not entry:
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
@@ -963,7 +1135,7 @@ async def delete_file(request: Request, name: str):
             manager.trigger_delete_task(client_id, remote_name)
 
     # 立即删除本地缓存和元数据
-    file_manager._delete_entry(sha256)
+    file_manager.delete_entry(sha256)
 
     Logger.api_response(request_id, "本地文件已删除，远程删除任务已派发")
     return JSONResponse(status_code=status.HTTP_200_OK, content={})

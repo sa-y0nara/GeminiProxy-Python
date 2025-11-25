@@ -31,6 +31,9 @@ const getSafePayloadLog = (obj: any) => {
       if (typeof value === 'string' && value.length > 200) {
         return value.substring(0, 200) + '... [TRUNCATED]';
       }
+      if (key === 'data_bytes' || value instanceof Uint8Array) {
+        return `[Binary Data: ${value.length || value.byteLength} bytes]`;
+      }
       return value;
     }, 2);
   } catch (e) {
@@ -84,6 +87,9 @@ const connectInternal = () => {
     return;
   }
   ws = new WebSocket(`${websocketUrl}/${clientId}`);
+  // IMPORTANT: Set binaryType to 'arraybuffer' to handle mixed JSON+Binary messages
+  ws.binaryType = 'arraybuffer';
+  
   callbacks?.onLog(`Connecting to ${websocketUrl}/${clientId}...`);
 
   ws.onopen = () => {
@@ -123,26 +129,54 @@ const connectInternal = () => {
   ws.onmessage = async (event) => {
     let command: Command | null = null;
     try {
-      const message = JSON.parse(event.data);
-      
-      // Handle cancel task
-      if (message.type === 'cancel_task') {
-        const requestId = message.id;
-        callbacks?.onLog(`Received cancel request for: ${requestId}`);
+      // Parse the message based on its type
+      if (typeof event.data === 'string') {
+        // Standard JSON text frame
+        const message = JSON.parse(event.data);
         
-        const cancelled = geminiExecutor.cancelExecution(requestId);
-        
-        if (!cancelled) {
-          callbacks?.onLog(`Request ${requestId} was not active or already completed`);
+        // Handle cancel task
+        if (message.type === 'cancel_task') {
+          const requestId = message.id;
+          callbacks?.onLog(`Received cancel request for: ${requestId}`);
+          const cancelled = geminiExecutor.cancelExecution(requestId);
+          if (!cancelled) {
+            callbacks?.onLog(`Request ${requestId} was not active or already completed`);
+          }
+          return;
         }
-        return;
+        command = message as Command;
+      } else if (event.data instanceof ArrayBuffer) {
+        // Binary frame: [HeaderLength(Uint32, 4bytes)] + [JSON Metadata] + [Binary Data]
+        // Protocol: Big Endian for header length
+        const view = new DataView(event.data);
+        const headerLength = view.getUint32(0, false); // false = Big Endian (Network Byte Order)
+        
+        const jsonBytes = new Uint8Array(event.data, 4, headerLength);
+        const jsonStr = new TextDecoder("utf-8").decode(jsonBytes);
+        const metadata = JSON.parse(jsonStr);
+        
+        const binaryData = new Uint8Array(event.data, 4 + headerLength);
+        
+        // Construct the command object
+        command = metadata as Command;
+        
+        // Inject the binary data into the payload
+        // We assume 'upload_chunk' commands are the consumers of this binary data
+        if (command && command.payload) {
+            (command.payload as any).data_bytes = binaryData;
+        }
+        
+        console.debug(`Received binary frame. Header len: ${headerLength}, Binary body: ${binaryData.byteLength} bytes.`);
+      } else {
+        throw new Error(`Unsupported WebSocket message type: ${typeof event.data}`);
       }
-      
-      command = message as Command;
+
+      if (!command) throw new Error("Failed to parse command.");
+
       callbacks?.onLog(`Received command: ${command.type} (ID: ${command.id})`);
       
       // --- DEBUG: Log Incoming Payload ---
-      console.log(`[Request ${command.id}] Payload:`, command.payload);
+      // console.log(`[Request ${command.id}] Payload:`, command.payload);
       callbacks?.onLog(`Params: ${getSafePayloadLog(command.payload)}`);
       // -----------------------------------
 
@@ -152,7 +186,7 @@ const connectInternal = () => {
           const p = payload as any;
           if (p && p.chunk) {
             // 1. Log full chunk to browser console for detailed inspection
-            console.log(`[StreamChunk ${command.id}]`, p.chunk);
+            // console.log(`[StreamChunk ${command.id}]`, p.chunk);
             
             // 2. Log truncated snippet to UI Event Log to avoid spamming/lagging
             const chunkStr = typeof p.chunk === 'string' ? p.chunk : JSON.stringify(p.chunk);
@@ -212,14 +246,13 @@ const connectInternal = () => {
         const result = await geminiExecutor.execute(command, sendResponse, backendUrl);
         
         // --- DEBUG: Log Execution Result ---
-        console.log(`[Response ${command.id}] Result:`, result);
+        // console.log(`[Response ${command.id}] Result:`, result);
         callbacks?.onLog(`Result: ${getSafePayloadLog(result)}`);
         // -----------------------------------
         
         const response: ResponsePayload = { id: command.id, payload: result, status: { error: false, code: 200 } };
         
-        // Optimistic send logic: Just try to send it immediately.
-        // Don't wait for readyState === OPEN in a loop, as it causes latency if state is flaky.
+        // Optimistic send logic
         let attempts = 0;
         const maxAttempts = 5; 
         

@@ -56,19 +56,15 @@ class ConnectionManager:
 
     async def disconnect(self, client_id: str):
         """断开客户端连接，清理所有活跃请求"""
-        # 清理该客户端的所有活跃请求
         if client_id in self.client_active_requests:
             request_ids = list(self.client_active_requests[client_id])
             Logger.event("DISCONNECT", f"取消 {len(request_ids)} 个请求", client_id=client_id)
 
-            # 使用 cancel_request 统一清理
             for request_id in request_ids:
-                await self.cancel_request(request_id)
+                self.cancel_request(request_id)
 
-            # 确保客户端条目被删除
             self.client_active_requests.pop(client_id, None)
 
-        # 清理连接
         if client_id in self.active_connections:
             del self.active_connections[client_id]
         if client_id in self._client_ids:
@@ -85,49 +81,58 @@ class ConnectionManager:
             Logger.debug(f"接收消息 {request_id} | 完成: {is_finished} | 状态: {status}")
             Logger.debug(f"完整消息内容: {message}")
 
-        # 检查是否为流式响应
+        # 处理流式响应
         if request_id in self.streaming_responses:
-            queue = self.streaming_responses[request_id]
-            if payload.get("is_streaming"):
-                if request_id not in self.streaming_chunk_count:
-                    self.streaming_chunk_count[request_id] = 0
-                self.streaming_chunk_count[request_id] += 1
-                chunk_num = self.streaming_chunk_count[request_id]
-
-                if "chunk" in payload:
-                    queue.put_nowait(payload["chunk"])
-
-                client_id = self.request_to_client.get(request_id, "unknown")
-
-                if payload.get("is_finished"):
-                    queue.put_nowait(None)
-                    Logger.ws_receive(request_id, client_id, is_stream_end=True, total_chunks=chunk_num, data=message)
-                    self._cleanup_request(request_id)
-                elif chunk_num == 1:
-                    Logger.ws_receive(request_id, client_id, is_stream_start=True, data=message)
-                else:
-                    Logger.ws_receive(request_id, client_id, is_stream_middle=True, data=message)
+            await self._handle_streaming_message(request_id, payload, message)
             return
 
         # 处理非流式响应
         if request_id and request_id in self.pending_responses:
-            client_id = self.request_to_client.get(request_id, "unknown")
-            Logger.ws_receive(request_id, client_id, data=message)
-            future = self.pending_responses.pop(request_id)
-            error_info = message.get("status", {}).get("error")
-            if error_info:
-                # 增加健壮性，处理 error_info 不是字典的情况
-                if isinstance(error_info, dict):
-                    code = error_info.get("code", 500)
-                    detail = error_info
-                else:
-                    code = 500
-                    detail = {"message": str(error_info)}
+            await self._handle_non_streaming_message(request_id, payload, message)
 
-                exception = ApiException(status_code=code, detail=detail)
-                future.set_exception(exception)
+    async def _handle_streaming_message(self, request_id: str, payload: dict, message: dict):
+        """处理流式响应消息"""
+        if not payload.get("is_streaming"):
+            return
+
+        queue = self.streaming_responses[request_id]
+        if request_id not in self.streaming_chunk_count:
+            self.streaming_chunk_count[request_id] = 0
+        self.streaming_chunk_count[request_id] += 1
+        chunk_num = self.streaming_chunk_count[request_id]
+
+        if "chunk" in payload:
+            queue.put_nowait(payload["chunk"])
+
+        client_id = self.request_to_client.get(request_id, "unknown")
+
+        if payload.get("is_finished"):
+            queue.put_nowait(None)
+            Logger.ws_receive(request_id, client_id, is_stream_end=True, total_chunks=chunk_num, data=message)
+            self._cleanup_request(request_id)
+        elif chunk_num == 1:
+            Logger.ws_receive(request_id, client_id, is_stream_start=True, data=message)
+        else:
+            Logger.ws_receive(request_id, client_id, is_stream_middle=True, data=message)
+
+    async def _handle_non_streaming_message(self, request_id: str, payload: dict, message: dict):
+        """处理非流式响应消息"""
+        client_id = self.request_to_client.get(request_id, "unknown")
+        Logger.ws_receive(request_id, client_id, data=message)
+        future = self.pending_responses.pop(request_id)
+        error_info = message.get("status", {}).get("error")
+        if error_info:
+            if isinstance(error_info, dict):
+                code = error_info.get("code", 500)
+                detail = error_info
             else:
-                future.set_result(payload)
+                code = 500
+                detail = {"message": str(error_info)}
+
+            exception = ApiException(status_code=code, detail=detail)
+            future.set_exception(exception)
+        else:
+            future.set_result(payload)
 
     def get_next_client(self) -> str:
         """轮询算法，获取下一个健康的客户端ID"""
@@ -226,6 +231,14 @@ class ConnectionManager:
         if not request_id:
             raise ValueError("Binary commands require an 'id' field.")
 
+        # 验证二进制数据大小
+        max_binary_bytes = settings.MAX_BINARY_SIZE_MB * 1024 * 1024
+        if binary_body and len(binary_body) > max_binary_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_413_PAYLOAD_TOO_LARGE,
+                detail=f"Binary payload exceeds maximum size of {settings.MAX_BINARY_SIZE_MB}MB",
+            )
+
         websocket = self.active_connections[client_id]
         Logger.ws_send(request_id, client_id, command.get("type", "unknown"), command=command)
         return await self._handle_binary_request(websocket, command, binary_body, request_id)
@@ -243,8 +256,19 @@ class ConnectionManager:
         对于流式请求，返回异步生成器。
         实际的注册和清理由 `monitored_proxy_request` 上下文管理器处理。
         """
-        client_id = self.request_to_client[request_id]
-        websocket = self.active_connections[client_id]
+        client_id = self.request_to_client.get(request_id)
+        if not client_id:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Request not properly registered with a client"
+            )
+        
+        websocket = self.active_connections.get(client_id)
+        if not websocket:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Client {client_id} is no longer connected"
+            )
 
         if isinstance(payload, BaseModel):
             payload_to_send = payload.model_dump(by_alias=True, exclude_none=True)
@@ -270,57 +294,11 @@ class ConnectionManager:
         self, websocket: WebSocket, command: dict[str, Any], request_id: str
     ) -> Any:
         """Handles a non-streaming request."""
-        future = asyncio.get_running_loop().create_future()
-        self.pending_responses[request_id] = future
-        try:
-            await websocket.send_json(command)
-            response_payload = await asyncio.wait_for(
-                future, timeout=settings.WEBSOCKET_TIMEOUT
-            )
-            # Cleanup is handled when the response is received in `handle_message`
-            return response_payload
-        except asyncio.TimeoutError:
-            self._cleanup_request(request_id)
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Request to frontend client timed out",
-            )
-        except ApiException as e:
-            self._cleanup_request(request_id)
-            # 在这里实现全局重置逻辑
-            error_detail = e.detail or {}
-            error_message = error_detail.get("message", "").lower()
-
-            # 检查是否是文件未找到的特定错误
-            if "not found" in error_message or "file not found" in error_message:
-                # 尝试从命令的 payload 中找到 file_name
-                file_name = command.get("payload", {}).get("fileName")
-                if not file_name and request_id in self.request_file_aliases:
-                    alias_map = self.request_file_aliases.get(request_id) or {}
-                    if len(alias_map) == 1:
-                        file_name = next(iter(alias_map.keys()))
-                    elif alias_map:
-                        Logger.warning(
-                            "无法确定具体缺失的文件，存在多个候选",
-                            request_id=request_id,
-                            aliases=list(alias_map.keys()),
-                        )
-                if file_name:
-                    sha256 = file_manager.get_sha256_by_filename(file_name)
-                    if sha256:
-                        Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
-                        file_manager.reset_replication_map(sha256)
-                        # 标记异常，以便上层进行同步重建
-                        e.is_resettable = True
-
-            # 重新抛出更详细的HTTP异常
-            raise HTTPException(status_code=e.status_code, detail=e.detail)
-        except Exception as e:
-            self._cleanup_request(request_id)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Error communicating with frontend client: {str(e)}",
-            )
+        return await self._await_response(
+            request_id,
+            command,
+            lambda: websocket.send_json(command),
+        )
 
     async def _handle_binary_request(
         self,
@@ -330,48 +308,72 @@ class ConnectionManager:
         request_id: str,
     ) -> Any:
         """Handles a binary upload request."""
+        packet = self._build_binary_packet(command, binary_body)
+        return await self._await_response(
+            request_id,
+            command,
+            lambda: websocket.send_bytes(packet),
+        )
+
+    async def _await_response(
+        self,
+        request_id: str,
+        command: dict[str, Any],
+        sender,
+    ) -> Any:
+        """Send a command and wait for the registered response future."""
         future = asyncio.get_running_loop().create_future()
         self.pending_responses[request_id] = future
         try:
-            packet = self._build_binary_packet(command, binary_body)
-            await websocket.send_bytes(packet)
-            response_payload = await asyncio.wait_for(future, timeout=settings.WEBSOCKET_TIMEOUT)
-            return response_payload
+            await sender()
+            return await asyncio.wait_for(future, timeout=settings.WEBSOCKET_TIMEOUT)
         except asyncio.TimeoutError:
             self._cleanup_request(request_id)
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Request to frontend client timed out",
             )
-        except ApiException as e:
+        except ApiException as exc:
             self._cleanup_request(request_id)
-            error_detail = e.detail or {}
-            error_message = error_detail.get("message", "").lower()
-            if "not found" in error_message or "file not found" in error_message:
-                file_name = command.get("payload", {}).get("fileName")
-                if not file_name and request_id in self.request_file_aliases:
-                    alias_map = self.request_file_aliases.get(request_id) or {}
-                    if len(alias_map) == 1:
-                        file_name = next(iter(alias_map.keys()))
-                    elif alias_map:
-                        Logger.warning(
-                            "无法确定具体缺失的文件，存在多个候选",
-                            request_id=request_id,
-                            aliases=list(alias_map.keys()),
-                        )
-                if file_name:
-                    sha256 = file_manager.get_sha256_by_filename(file_name)
-                    if sha256:
-                        Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
-                        file_manager.reset_replication_map(sha256)
-                        e.is_resettable = True
-            raise HTTPException(status_code=e.status_code, detail=e.detail)
-        except Exception as e:
+            self._mark_resettable_if_needed(exc, command, request_id)
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+        except Exception as exc:
             self._cleanup_request(request_id)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Error communicating with frontend client: {str(e)}",
+                detail=f"Error communicating with frontend client: {exc}",
             )
+
+    def _mark_resettable_if_needed(self, exc: ApiException, command: dict[str, Any], request_id: str):
+        """Inspect ApiException and mark it resettable if it's a missing-file scenario."""
+        error_detail = exc.detail or {}
+        # 验证 error_detail 是字典类型，避免属性访问错误
+        if not isinstance(error_detail, dict):
+            error_detail = {}
+        error_message = str(error_detail.get("message", "")).lower() if error_detail else ""
+        if "not found" not in error_message and "file not found" not in error_message:
+            return
+
+        file_name = command.get("payload", {}).get("fileName")
+        if not file_name and request_id in self.request_file_aliases:
+            alias_map = self.request_file_aliases.get(request_id) or {}
+            if len(alias_map) == 1:
+                file_name = next(iter(alias_map.keys()))
+            elif alias_map:
+                Logger.warning(
+                    "无法确定具体缺失的文件，存在多个候选",
+                    request_id=request_id,
+                    aliases=list(alias_map.keys()),
+                )
+        if not file_name:
+            return
+
+        sha256 = file_manager.get_sha256_by_filename(file_name)
+        if not sha256:
+            return
+        Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
+        file_manager.reset_replication_map(sha256)
+        exc.is_resettable = True
 
     def _build_binary_packet(self, command: dict[str, Any], binary_body: bytes) -> bytes:
         """构造前端约定的二进制帧: [len][json][binary]."""
@@ -479,14 +481,11 @@ class ConnectionManager:
 
             fixed_contents.append(content)
 
-        # 如果有修改，返回新的 payload
-        if len(fixed_contents) != len(contents):
-            new_payload = payload.copy()
-            new_payload["payload"] = payload["payload"].copy()
-            new_payload["payload"]["contents"] = fixed_contents
-            return new_payload
-
-        return payload
+        # 始终返回重构后的 payload（即使长度相同，内容也可能被修改）
+        new_payload = payload.copy()
+        new_payload["payload"] = payload["payload"].copy()
+        new_payload["payload"]["contents"] = fixed_contents
+        return new_payload
 
     def _get_nested_value(self, data: dict, path: str) -> Optional[Any]:
         """
@@ -511,97 +510,96 @@ class ConnectionManager:
         except (KeyError, TypeError):
             return None
 
-    async def handle_api_request(
-        self,
-        *,
-        command_type: str,
-        payload: Any,
-        request: Optional[Request] = None,
-        is_streaming: bool = False,
-    ) -> Any:
-        """
-        处理 API 请求的统一入口 (方案 B)。
-        集成了文件查找、客户端选择、回退、复制和容错逻辑。
-        """
-        request_id = str(uuid.uuid4())
+    async def _prepare_payload_for_request(self, command_type: str, payload: Any, request_id: str) -> Any:
+        """Apply command-specific preprocessing to payload."""
+        if command_type in {"generateContent", "streamGenerateContent"}:
+            return await self._fix_payload_mime_types(payload, request_id)
+        return payload
 
-        # 对于 generateContent 命令，首先修正 MIME 类型
-        if command_type == "generateContent" or command_type == "streamGenerateContent":
-            effective_payload = await self._fix_payload_mime_types(payload, request_id)
-        else:
-            effective_payload = payload
+    def _extract_file_name_from_parts(self, parts: list, request_id: str) -> Optional[str]:
+        """Extract file name from parts array in nested payload."""
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            file_data = part.get("fileData") or part.get("file_data")
+            if not isinstance(file_data, dict):
+                continue
+            file_uri = file_data.get("fileUri") or file_data.get("file_uri")
+            if not isinstance(file_uri, str):
+                continue
+            full_sha256 = file_manager.get_sha256_by_filename(file_uri)
+            if not full_sha256:
+                continue
+            cached_entry = file_manager.get_metadata_entry(full_sha256)
+            if cached_entry and cached_entry.original_filename:
+                Logger.info(
+                    f"[调试] 从 fileUri '{file_uri}' 找到文件名: {cached_entry.original_filename}",
+                    request_id=request_id,
+                )
+                return cached_entry.original_filename
+        return None
 
-        # 注意：这个解析逻辑非常脆弱，仅用于演示。生产代码需要更健壮的解析器。
-        original_file_name = None  # 仅用于日志展示
-
-        # 调试：记录 payload 结构
-        Logger.info(f"[调试] 原始 payload 结构: {payload}", request_id=request_id)
-        Logger.info(f"[调试] 有效 payload 结构: {effective_payload}", request_id=request_id)
-
-        # 尝试多种可能的文件名路径
+    def _find_original_file_name(self, payload: Any, request_id: str) -> Optional[str]:
+        """Best-effort extraction of the original file name for logging and retries."""
+        original_file_name: Optional[str] = None
         try:
-            if isinstance(effective_payload, dict):
-                if "payload" in effective_payload:
-                    payload_contents = effective_payload["payload"]
-                    if isinstance(payload_contents, dict) and "contents" in payload_contents:
-                        contents = payload_contents["contents"]
-                        if isinstance(contents, list) and len(contents) > 0:
+            if isinstance(payload, dict):
+                if "payload" in payload:
+                    payload_contents = payload.get("payload", {})
+                    if isinstance(payload_contents, dict):
+                        contents = payload_contents.get("contents", [])
+                        if isinstance(contents, list) and contents:
                             content = contents[0]
                             if isinstance(content, dict):
-                                # 检查可能的文件名位置
-                                file_name = None
                                 for path in ["fileData.fileName", "file_data.fileName"]:
                                     file_name = self._get_nested_value(content, path)
                                     if file_name:
                                         original_file_name = file_name
-                                        Logger.info(f"[调试] 找到文件名: {file_name} (路径: {path})", request_id=request_id)
+                                        Logger.info(
+                                            f"[调试] 找到文件名: {file_name} (路径: {path})",
+                                            request_id=request_id,
+                                        )
                                         break
 
-                                # 如果没有找到 fileName，遍历 parts 查找 fileData
                                 if not original_file_name:
                                     parts = content.get("parts", [])
-                                    if isinstance(parts, list):
-                                        for part in parts:
-                                            if isinstance(part, dict):
-                                                file_data = part.get("fileData") or part.get("file_data")
-                                                if isinstance(file_data, dict):
-                                                    file_uri = file_data.get("fileUri") or file_data.get("file_uri")
-                                                    if file_uri and isinstance(file_uri, str):
-                                                        # 使用 file_uri (即 file.name) 来查找完整的 SHA256
-                                                        full_sha256 = file_manager.get_sha256_by_filename(file_uri)
-                                                        if full_sha256:
-                                                            cached_entry = file_manager.get_metadata_entry(full_sha256)
-                                                            if cached_entry and cached_entry.original_filename:
-                                                                original_file_name = cached_entry.original_filename
-                                                                Logger.info(
-                                                                    f"[调试] 从 fileUri '{file_uri}' 找到文件名: {original_file_name}",
-                                                                    request_id=request_id,
-                                                                )
-                                                                break  # 找到后跳出 parts 循环
+                                    original_file_name = self._extract_file_name_from_parts(parts, request_id)
                                     if not original_file_name:
-                                        Logger.warning(f"[调试] 无法从 payload 中提取有效的文件名或 fileUri", request_id=request_id)
+                                        Logger.warning(
+                                            "[调试] 无法从 payload 中提取有效的文件名或 fileUri",
+                                            request_id=request_id,
+                                        )
                 else:
-                    # 直接检查顶层
                     for path in ["fileData.fileName", "file_data.fileName", "fileName"]:
-                        file_name = self._get_nested_value(effective_payload, path)
+                        file_name = self._get_nested_value(payload, path)
                         if file_name:
                             original_file_name = file_name
-                            Logger.info(f"[调试] 找到文件名: {file_name} (路径: {path})", request_id=request_id)
+                            Logger.info(
+                                f"[调试] 找到文件名: {file_name} (路径: {path})",
+                                request_id=request_id,
+                            )
                             break
-
             Logger.info(f"[调试] 解析出的文件名: {original_file_name}", request_id=request_id)
+        except Exception as exc:
+            Logger.warning(f"解析文件名时出错: {exc}", request_id=request_id)
+        return original_file_name
 
-        except Exception as e:
-            Logger.warning(f"解析文件名时出错: {e}", request_id=request_id)
-
-        client_id = self.get_next_client()  # 默认轮询
+    async def _resolve_client_and_files(
+        self,
+        *,
+        payload: Any,
+        request_id: str,
+        initial_client_id: str,
+    ) -> tuple[str, dict[str, str], Optional[str]]:
+        """Determine the best client and ensure file references are ready."""
+        alias_map: dict[str, str] = {}
+        fallback_alias: Optional[str] = None
 
         file_refs: list[FileReference] = []
         try:
-            file_refs = self._extract_file_references(effective_payload, request_id)
-            if not original_file_name and file_refs:
-                original_file_name = file_refs[0].alias
+            file_refs = self._extract_file_references(payload, request_id)
             if file_refs:
+                fallback_alias = file_refs[0].alias
                 alias_list = [
                     ref.alias or ref.entry.replication_map.get("local", {}).get("name") or ref.sha256[:8]
                     for ref in file_refs
@@ -615,79 +613,123 @@ class ConnectionManager:
         except Exception as exc:
             Logger.warning("遍历 payload 文件引用失败", exc=exc, request_id=request_id)
 
-        if file_refs:
-            required_entries = {ref.sha256: ref.entry for ref in file_refs}
-            missing_for_initial = self._collect_missing_for_client(required_entries, client_id)
+        client_id = initial_client_id
+        if not file_refs:
+            return client_id, alias_map, fallback_alias
 
-            if missing_for_initial:
-                best_client_id, missing_for_best, initial_missing = self._select_best_client(
-                    required_entries, client_id
-                )
+        required_entries = {ref.sha256: ref.entry for ref in file_refs}
+        missing_for_initial = self._collect_missing_for_client(required_entries, client_id)
 
-                if missing_for_best:
-                    await self._replicate_files_to_client(best_client_id, missing_for_best, request_id)
+        if missing_for_initial:
+            best_client_id, missing_for_best, initial_missing = self._select_best_client(
+                required_entries, client_id
+            )
 
-                if best_client_id != client_id and initial_missing:
-                    self.trigger_bulk_replication(client_id, initial_missing)
+            if missing_for_best:
+                await self._replicate_files_to_client(best_client_id, missing_for_best, request_id)
 
-                client_id = best_client_id
+            if best_client_id != client_id and initial_missing:
+                self.trigger_bulk_replication(client_id, initial_missing)
 
-            await self._ensure_remote_files_available(client_id, file_refs, request_id)
-            alias_map: dict[str, str] = {}
-            self._rewrite_file_references(file_refs, client_id, request_id, alias_map)
-            if alias_map:
-                self.request_file_aliases[request_id] = alias_map
+            client_id = best_client_id
 
-        # 实际执行请求
+        await self._ensure_remote_files_available(client_id, file_refs, request_id)
+        self._rewrite_file_references(file_refs, client_id, request_id, alias_map)
+        return client_id, alias_map, fallback_alias
+
+    @asynccontextmanager
+    async def _bind_request_to_client(self, request_id: str, client_id: str):
+        """Register the current request to a client for cleanup and tracing."""
+        self.request_to_client[request_id] = client_id
+        if client_id not in self.client_active_requests:
+            self.client_active_requests[client_id] = set()
+        self.client_active_requests[client_id].add(request_id)
         try:
-            # 为方案 B 修改 monitored_proxy_request 调用
-            self.request_to_client[request_id] = client_id
-            if client_id not in self.client_active_requests:
-                self.client_active_requests[client_id] = set()
-            self.client_active_requests[client_id].add(request_id)
+            yield
+        finally:
+            self.request_to_client.pop(request_id, None)
+            if client_id in self.client_active_requests:
+                self.client_active_requests[client_id].discard(request_id)
 
-            try:
-                result = await self.proxy_request(
+    async def handle_api_request(
+        self,
+        *,
+        command_type: str,
+        payload: Any,
+        request: Optional[Request] = None,
+        is_streaming: bool = False,
+    ) -> Any:
+        """
+        处理 API 请求的统一入口 (方案 B)。
+        集成了文件查找、客户端选择、回退、复制和容错逻辑。
+        """
+        request_id = str(uuid.uuid4())
+        effective_payload = await self._prepare_payload_for_request(command_type, payload, request_id)
+
+        Logger.debug(f"原始 payload 已接收", request_id=request_id)
+        Logger.debug(f"有效 payload 已准备", request_id=request_id)
+
+        original_file_name = self._find_original_file_name(effective_payload, request_id)
+        client_id = self.get_next_client()
+
+        client_id, alias_map, fallback_alias = await self._resolve_client_and_files(
+            payload=effective_payload,
+            request_id=request_id,
+            initial_client_id=client_id,
+        )
+        if not original_file_name and fallback_alias:
+            original_file_name = fallback_alias
+
+        alias_map = alias_map or {}
+        self.request_file_aliases[request_id] = alias_map
+
+        try:
+            # For streaming, keep the mapping alive until stream ends (cleanup happens in stream finalizer)
+            # For non-streaming, bind briefly and cleanup when response is ready
+            if is_streaming:
+                self.request_to_client[request_id] = client_id
+                if client_id not in self.client_active_requests:
+                    self.client_active_requests[client_id] = set()
+                self.client_active_requests[client_id].add(request_id)
+                return await self.proxy_request(
                     command_type=command_type,
                     payload=effective_payload,
                     request=request,
                     request_id=request_id,
                     is_streaming=is_streaming,
                 )
-                return result
-            finally:
-                # 清理请求映射
-                self.request_to_client.pop(request_id, None)
-                if client_id in self.client_active_requests:
-                    self.client_active_requests[client_id].discard(request_id)
-                self.request_file_aliases.pop(request_id, None)
-        except Exception as e:
-            # 检查是否有可重置的错误
-            if hasattr(e, 'is_resettable') and getattr(e, 'is_resettable', False):
-                sha256_to_reset = None
-                if original_file_name:
-                    sha256_to_reset = file_manager.get_sha256_by_filename(original_file_name)
-
+            else:
+                async with self._bind_request_to_client(request_id, client_id):
+                    return await self.proxy_request(
+                        command_type=command_type,
+                        payload=effective_payload,
+                        request=request,
+                        request_id=request_id,
+                        is_streaming=is_streaming,
+                    )
+        except Exception as exc:
+            if hasattr(exc, 'is_resettable') and getattr(exc, 'is_resettable', False):
+                sha256_to_reset = file_manager.get_sha256_by_filename(original_file_name) if original_file_name else None
                 if sha256_to_reset:
-                    Logger.error("捕获到可重置的文件错误，将尝试同步重建", request_id=request_id, sha256=sha256_to_reset)
+                    Logger.error(
+                        "捕获到可重置的文件错误，将尝试同步重建",
+                        request_id=request_id,
+                        sha256=sha256_to_reset,
+                    )
                     try:
-                        # 1. 同步重建
                         new_file, new_client_id = await self._synchronously_rebuild_file(sha256_to_reset)
+                        if (isinstance(payload, dict) and "payload" in payload and 
+                            "contents" in payload["payload"] and len(payload["payload"]["contents"]) > 0):
+                            content = payload["payload"]["contents"][0]
+                            if isinstance(content, dict):
+                                file_data = content.get("fileData") or content.get("file_data")
+                                if isinstance(file_data, dict):
+                                    file_data["fileName"] = new_file["name"]
+                        if new_file and isinstance(new_file, dict):
+                            alias_map[new_file.get("name")] = sha256_to_reset
 
-                        # 2. 更新 payload
-                        if isinstance(payload, dict) and "payload" in payload and "contents" in payload["payload"]:
-                            payload["payload"]["contents"][0]["fileData"]["fileName"] = new_file["name"]
-
-                        # 3. 使用新的客户端和 payload 重试请求
                         Logger.event("RETRY_REQUEST", "使用重建的文件重试请求", request_id=request_id)
-
-                        # 设置新的请求映射
-                        self.request_to_client[request_id] = new_client_id
-                        if new_client_id not in self.client_active_requests:
-                            self.client_active_requests[new_client_id] = set()
-                        self.client_active_requests[new_client_id].add(request_id)
-
-                        try:
+                        async with self._bind_request_to_client(request_id, new_client_id):
                             return await self.proxy_request(
                                 command_type=command_type,
                                 payload=payload,
@@ -695,15 +737,15 @@ class ConnectionManager:
                                 request_id=request_id,
                                 is_streaming=is_streaming,
                             )
-                        finally:
-                            # 清理请求映射
-                            self.request_to_client.pop(request_id, None)
-                            if new_client_id in self.client_active_requests:
-                                self.client_active_requests[new_client_id].discard(request_id)
                     except Exception as rebuild_exc:
                         Logger.error("重试请求在同步重建后失败", exc=rebuild_exc, request_id=request_id)
-                        raise HTTPException(status_code=500, detail=f"File expired, and reconstruction failed: {rebuild_exc}")
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"File expired, and reconstruction failed: {rebuild_exc}",
+                        )
             raise
+        finally:
+            self.request_file_aliases.pop(request_id, None)
 
     async def _handle_streaming_request(
         self,
@@ -741,14 +783,14 @@ class ConnectionManager:
 
         return stream_generator()
 
-    async def cancel_request(self, request_id: str) -> bool:
+    def cancel_request(self, request_id: str) -> bool:
         """
-        取消指定的请求（唯一入口点）
+        取消指定的请求（同步入口点）
 
         职责：
         1. 检查请求是否存在
-        2. 发送取消信号给前端
-        3. 清理后端资源
+        2. 清理后端资源
+        3. 异步发送取消信号给前端
 
         Args:
             request_id: 要取消的请求ID
@@ -766,28 +808,31 @@ class ConnectionManager:
         # 步骤 2：获取处理该请求的客户端
         client_id = self.request_to_client[request_id]
 
-        # 步骤 3：发送取消信号（best effort）
-        cancel_signal_sent = False
-        if client_id in self.active_connections:
-            websocket = self.active_connections[client_id]
-            cancel_message = {
-                "type": "cancel_task",
-                "id": request_id
-            }
-            try:
-                await websocket.send_json(cancel_message)
-                Logger.event("CANCEL", "发送取消信号", request_id=request_id, client_id=client_id)
-                cancel_signal_sent = True
-            except Exception as e:
-                Logger.error("发送取消信号失败", exc=e, request_id=request_id, client_id=client_id)
-                # 即使发送失败，也要继续清理后端资源
-        else:
-            Logger.warning("客户端未连接，无法发送取消信号", client_id=client_id)
-
-        # 步骤 4：清理后端资源（必须执行）
+        # 步骤 3：清理后端资源（必须执行）
         self._cleanup_request(request_id)
 
+        # 步骤 4：异步发送取消信号（best effort）
+        if client_id in self.active_connections:
+            try:
+                asyncio.create_task(self._send_cancel_signal_async(websocket_id=client_id, request_id=request_id))
+            except RuntimeError:
+                Logger.warning("无法创建后台任务发送取消信号", request_id=request_id, client_id=client_id)
+        else:
+            Logger.debug("客户端未连接，跳过取消信号", client_id=client_id)
+
         return True
+
+    async def _send_cancel_signal_async(self, websocket_id: str, request_id: str):
+        """异步发送取消信号"""
+        try:
+            if websocket_id not in self.active_connections:
+                return
+            websocket = self.active_connections[websocket_id]
+            cancel_message = {"type": "cancel_task", "id": request_id}
+            await websocket.send_json(cancel_message)
+            Logger.event("CANCEL", "发送取消信号", request_id=request_id, client_id=websocket_id)
+        except (RuntimeError, ConnectionError, Exception) as e:
+            Logger.debug(f"发送取消信号失败 [{type(e).__name__}]", request_id=request_id, client_id=websocket_id)
 
     def _cleanup_request(self, request_id: str):
         """
@@ -980,69 +1025,50 @@ class ConnectionManager:
     ):
         """在发送请求前通过 get_file 校验所有引用是否仍然有效"""
         checked: set[str] = set()
-        needs_heal: list[str] = []
-
+        
+        # 收集需要验证的文件
+        to_verify = []
         for ref in file_refs:
             if ref.sha256 in checked:
                 continue
             checked.add(ref.sha256)
-
+            
             replication_data = ref.entry.replication_map.get(client_id)
             if not replication_data or replication_data.get("status") != "synced":
                 continue
             remote_name = replication_data.get("name")
             if not remote_name:
                 continue
-
-            verify_request_id = f"{request_id}-verify-{ref.sha256[:8]}"
-            try:
-                response = await self.send_command_to_client(
-                    client_id=client_id,
-                    command_type="get_file",
-                    payload={"file_name": remote_name},
-                    request_id=verify_request_id,
-                )
-                remote_file = response.get("file") if isinstance(response, dict) else response
-                if isinstance(remote_file, dict):
-                    file_manager.update_replication_status(ref.sha256, client_id, "synced", remote_file)
-            except HTTPException as exc:
-                status_code = exc.status_code
-                if status_code == status.HTTP_404_NOT_FOUND or status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
-                    Logger.warning(
-                        "远程文件校验失败，将触发重建",
-                        client_id=client_id,
-                        request_id=verify_request_id,
-                        sha256=ref.sha256[:8],
-                        status_code=status_code,
-                        detail=exc.detail,
-                    )
-                    needs_heal.append(ref.sha256)
-                else:
-                    raise
-            except ApiException as exc:
-                status_code = getattr(exc, "status_code", None) or status.HTTP_500_INTERNAL_SERVER_ERROR
-                if status_code == status.HTTP_404_NOT_FOUND or status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
-                    Logger.warning(
-                        "前端报告远端文件无效，将触发重建",
-                        client_id=client_id,
-                        request_id=verify_request_id,
-                        sha256=ref.sha256[:8],
-                        status_code=status_code,
-                        detail=getattr(exc, "detail", None),
-                    )
-                    needs_heal.append(ref.sha256)
-                else:
-                    raise
-            except Exception as exc:
-                Logger.warning(
-                    "校验远端文件出现异常，将触发重建",
-                    exc=exc,
-                    client_id=client_id,
-                    request_id=verify_request_id,
-                    sha256=ref.sha256[:8],
-                )
-                needs_heal.append(ref.sha256)
-
+            
+            to_verify.append((ref.sha256, remote_name))
+        
+        if not to_verify:
+            return
+        
+        # 使用 Semaphore 限制并发数量，避免过载
+        semaphore = asyncio.Semaphore(10)
+        
+        async def verify_with_semaphore(sha256: str, remote_name: str):
+            async with semaphore:
+                return await self._verify_single_file(client_id, sha256, remote_name, request_id)
+        
+        verify_tasks = [
+            verify_with_semaphore(sha256, remote_name)
+            for sha256, remote_name in to_verify
+        ]
+        
+        verify_results = await asyncio.gather(*verify_tasks, return_exceptions=True)
+        
+        # 收集需要修复的文件
+        needs_heal = []
+        for (sha256, _), result in zip(to_verify, verify_results):
+            if result is True:  # 验证成功
+                continue
+            elif result is False:  # 验证失败
+                needs_heal.append(sha256)
+            elif isinstance(result, Exception):
+                needs_heal.append(sha256)
+        
         if needs_heal:
             dedup = list(dict.fromkeys(needs_heal))
             Logger.warning(
@@ -1054,6 +1080,46 @@ class ConnectionManager:
             for sha in dedup:
                 file_manager.reset_replication_map(sha)
             await self._replicate_files_to_client(client_id, dedup, request_id)
+
+    async def _verify_single_file(
+        self,
+        client_id: str,
+        sha256: str,
+        remote_name: str,
+        request_id: str,
+    ) -> bool:
+        """验证单个文件是否在远端仍然有效"""
+        verify_request_id = f"{request_id}-verify-{sha256[:8]}"
+        try:
+            response = await self.send_command_to_client(
+                client_id=client_id,
+                command_type="get_file",
+                payload={"file_name": remote_name},
+                request_id=verify_request_id,
+            )
+            remote_file = response.get("file") if isinstance(response, dict) else response
+            if isinstance(remote_file, dict):
+                file_manager.update_replication_status(sha256, client_id, "synced", remote_file)
+            return True
+        except (HTTPException, ApiException) as exc:
+            status_code = getattr(exc, "status_code", None) or status.HTTP_500_INTERNAL_SERVER_ERROR
+            if status_code == status.HTTP_404_NOT_FOUND or status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+                Logger.warning(
+                    "远程文件校验失败",
+                    client_id=client_id,
+                    request_id=verify_request_id,
+                    sha256=sha256[:8],
+                )
+                return False
+            raise
+        except Exception as exc:
+            Logger.warning(
+                "校验远端文件异常",
+                exc=exc,
+                client_id=client_id,
+                sha256=sha256[:8],
+            )
+            return False
 
     async def _upload_file_via_client(
         self,
@@ -1257,17 +1323,12 @@ class ConnectionManager:
         request_id = f"delete-{file_name.replace('/', '-')}"
         Logger.event("DELETE_START", "开始异步远程文件删除", client_id=client_id, file_name=file_name)
         try:
-            # 创建一个虚拟的 Request 对象，因为这是后台任务
-            async def always_connected():
-                return False
-            mock_request = SimpleNamespace(is_disconnected=always_connected)
-
             await self._direct_proxy_request(
                 command_type="delete_file",
                 payload={"file_name": file_name},
                 request_id=request_id,
                 client_id=client_id,
-                request=mock_request,
+                request=self._build_background_request(),
             )
             Logger.event("DELETE_SUCCESS", "异步远程文件删除成功", client_id=client_id, file_name=file_name)
         except Exception as e:

@@ -1,8 +1,9 @@
 import mimetypes
 import os
+import re
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, FrozenSet
 
 class MimeUtils:
     """MIME 类型处理工具类"""
@@ -85,6 +86,16 @@ class MimeUtils:
         (b"\x1a\x45\xdf\xa3", "video/webm", ".webm"),
     ]
 
+    _BINARY_EXTENSIONS: FrozenSet[str] = frozenset({
+        '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.pdf',
+        '.mp3', '.wav', '.mp4', '.avi', '.mov', '.zip', '.rar',
+        '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+    })
+
+    _UNKNOWN_MIME_PATTERNS = (re.compile(r"^chemical/"), re.compile(r"^application/x-"))
+    
+    _MIME_EXTENSION_CACHE: Optional[dict] = None
+
     @classmethod
     def infer_mime_type(cls, filename: str, fallback_mime: str = "application/octet-stream") -> str:
         """
@@ -130,13 +141,8 @@ class MimeUtils:
         if not mime_type or mime_type == "application/octet-stream":
             return True
 
-        # 对于常见的二进制文件类型，如果被标记为 text/plain，也应该修正
-        binary_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.pdf',
-                           '.mp3', '.wav', '.mp4', '.avi', '.mov', '.zip', '.rar',
-                           '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'}
-
         _, ext = os.path.splitext(filename.lower())
-        if ext in binary_extensions and mime_type.startswith('text/'):
+        if ext in cls._BINARY_EXTENSIONS and mime_type.startswith('text/'):
             return True
 
         return False
@@ -158,9 +164,7 @@ class MimeUtils:
 
         corrected_mime = cls.infer_mime_type(filename)
 
-        # 如果推断出的类型仍然是不常见的未知类型，且原类型不是 application/octet-stream，保持原类型
-        unknown_mime_patterns = ["chemical/", "application/x-"]
-        is_unknown = any(corrected_mime.startswith(pattern) for pattern in unknown_mime_patterns)
+        is_unknown = any(pattern.match(corrected_mime) for pattern in cls._UNKNOWN_MIME_PATTERNS)
 
         if is_unknown and current_mime != "application/octet-stream":
             return current_mime
@@ -283,9 +287,11 @@ class MimeUtils:
         if not mime_type:
             return default
 
-        for ext, mapped in cls.EXTENSION_MIME_MAP.items():
-            if mapped == mime_type:
-                return ext
+        if cls._MIME_EXTENSION_CACHE is None:
+            cls._MIME_EXTENSION_CACHE = {v: k for k, v in cls.EXTENSION_MIME_MAP.items()}
+        
+        if mime_type in cls._MIME_EXTENSION_CACHE:
+            return cls._MIME_EXTENSION_CACHE[mime_type]
 
         guessed = mimetypes.guess_extension(mime_type)
         if guessed:
