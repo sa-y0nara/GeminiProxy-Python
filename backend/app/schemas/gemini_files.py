@@ -35,7 +35,7 @@ class Status(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("details")
-    def validate_details(self, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def validate_details(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if v is not None:
             for idx, item in enumerate(v):
                 if not isinstance(item, dict) or "@type" not in item:
@@ -53,7 +53,7 @@ class VideoFileMetadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("video_duration")
-    def validate_video_duration(self, v: str) -> str:
+    def validate_video_duration(cls, v: str) -> str:
         if v is not None and not re.match(DURATION_PATTERN, v):
             raise ValueError("Invalid duration format")
         return v
