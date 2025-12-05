@@ -4,7 +4,7 @@ import random
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
@@ -13,9 +13,6 @@ from app.core.config import settings
 from app.core.exceptions import ApiException
 from app.core.file_manager import FileCacheEntry, file_manager
 from app.core.log_utils import Logger
-
-if TYPE_CHECKING:
-    from app.core.websocket_manager import ConnectionManager
 
 
 @dataclass
@@ -36,12 +33,6 @@ class FileSyncService:
 
     def __init__(self):
         pass
-
-    def _build_background_request(self) -> SimpleNamespace:
-        async def _always_connected():
-            return False
-
-        return SimpleNamespace(is_disconnected=_always_connected)
 
     def _resolve_sha_from_file_dict(self, file_dict: dict) -> tuple[Optional[str], Optional[str]]:
         for key in ("fileUri", "file_uri", "fileName", "file_name", "fileId", "file_id"):
@@ -94,7 +85,7 @@ class FileSyncService:
 
     def select_best_client(
         self,
-        manager: "ConnectionManager",
+        manager: Any,
         required_entries: dict[str, FileCacheEntry],
         preferred_client: str,
     ) -> tuple[str, list[str], list[str]]:
@@ -179,7 +170,7 @@ class FileSyncService:
 
     async def ensure_remote_files_available(
         self,
-        manager: "ConnectionManager",
+        manager: Any,
         client_id: str,
         file_refs: list[FileReference],
         request_id: str,
@@ -244,7 +235,7 @@ class FileSyncService:
 
     async def verify_single_file(
         self,
-        manager: "ConnectionManager",
+        manager: Any,
         client_id: str,
         sha256: str,
         remote_name: str,
@@ -283,10 +274,16 @@ class FileSyncService:
                 sha256=sha256[:8],
             )
             return False
+            
+    def _build_background_request(self) -> SimpleNamespace:
+        async def _always_connected():
+            return False
+
+        return SimpleNamespace(is_disconnected=_always_connected)
 
     async def upload_file_via_client(
         self,
-        manager: "ConnectionManager",
+        manager: Any,
         sha256: str,
         client_id: str,
         *,
@@ -390,7 +387,7 @@ class FileSyncService:
 
     async def replicate_files_to_client(
         self,
-        manager: "ConnectionManager",
+        manager: Any,
         client_id: str,
         sha_list: list[str],
         request_id: str,
@@ -415,7 +412,7 @@ class FileSyncService:
 
     async def resolve_client_and_files(
         self,
-        manager: "ConnectionManager",
+        manager: Any,
         *,
         payload: Any,
         request_id: str,
@@ -467,14 +464,14 @@ class FileSyncService:
         self.rewrite_file_references(file_refs, client_id, request_id, alias_map)
         return client_id, alias_map, fallback_alias
 
-    def trigger_bulk_replication(self, manager: "ConnectionManager", client_id: str, sha_list: list[str]):
+    def trigger_bulk_replication(self, manager: Any, client_id: str, sha_list: list[str]):
         """触发后台任务，批量为客户端复制缺失文件"""
         if not sha_list:
             return
         task_id = f"heal-{client_id}-{uuid.uuid4().hex[:6]}"
         create_background_task(self.bulk_replication_task(manager, client_id, sha_list, task_id))
 
-    async def bulk_replication_task(self, manager: "ConnectionManager", client_id: str, sha_list: list[str], task_id: str):
+    async def bulk_replication_task(self, manager: Any, client_id: str, sha_list: list[str], task_id: str):
         """后台批量复制任务"""
         Logger.event(
             "SELF_HEAL_START",
@@ -501,7 +498,7 @@ class FileSyncService:
                 exc=exc,
             )
 
-    async def synchronously_rebuild_file(self, manager: "ConnectionManager", sha256: str) -> tuple[dict, str]:
+    async def synchronously_rebuild_file(self, manager: Any, sha256: str) -> tuple[dict, str]:
         """
         同步重建文件：轮询选择一个客户端，阻塞式地指挥它重新上传文件。
         """
@@ -518,11 +515,11 @@ class FileSyncService:
             Logger.error("同步文件重建失败", exc=e, sha256=sha256, client_id=client_id)
             raise  # 将异常向上抛出
 
-    def trigger_delete_task(self, manager: "ConnectionManager", client_id: str, file_name: str):
+    def trigger_delete_task(self, manager: Any, client_id: str, file_name: str):
         """触发一个后台任务来异步删除远程文件"""
         create_background_task(self.delete_file_task(manager, client_id, file_name))
 
-    async def delete_file_task(self, manager: "ConnectionManager", client_id: str, file_name: str):
+    async def delete_file_task(self, manager: Any, client_id: str, file_name: str):
         """异步删除远程文件的实际后台任务"""
         request_id = f"delete-{file_name.replace('/', '-')}"
         Logger.event("DELETE_START", "开始异步远程文件删除", client_id=client_id, file_name=file_name)
