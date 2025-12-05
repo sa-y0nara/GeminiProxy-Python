@@ -81,13 +81,195 @@ const createErrorResponse = (error: unknown, command: Command | null): ErrorPayl
   return response;
 };
 
+      ws.onmessage = async (event) => {
+    try {
+      const command = parseMessage(event.data);
+      if (!command) return; // Handled internally (e.g. cancel_task)
+
+      callbacks?.onLog(`Received command: ${command.type} (ID: ${command.id})`);
+      callbacks?.onLog(`Params: ${getSafePayloadLog(command.payload)}`);
+
+      // Prepare backend URL
+      let backendUrl = '';
+      try {
+        const urlObj = new URL(websocketUrl);
+        const protocol = urlObj.protocol === 'wss:' ? 'https:' : 'http:';
+        backendUrl = `${protocol}//${urlObj.host}`;
+      } catch (e) {
+        console.error("Could not parse WebSocket URL for backend origin", e);
+      }
+
+      // Execute logic
+      if (command.type === 'streamGenerateContent') {
+        await geminiExecutor.execute(command, (payload) => sendStreamResponse(command!, payload), backendUrl);
+        callbacks?.onLog(`Finished streaming for command ID: ${command.id}`);
+      } else {
+        const result = await geminiExecutor.execute(command, () => {}, backendUrl);
+        callbacks?.onLog(`Result: ${getSafePayloadLog(result)}`);
+        
+        const response: ResponsePayload = { 
+          id: command.id, 
+          payload: result, 
+          status: { error: false, code: 200 } 
+        };
+        sendMessageWithRetry(response, `success response for ID ${command.id}`);
+      }
+
+    } catch (error) {
+      // If parsing failed, command might be null.
+      // In that case, we can't reply with an ID, so we just log.
+      // If parsing succeeded but execution failed, we reply with error.
+      // Note: parseMessage throws if it fails, so command is null there.
+      // We need to handle the case where we have a command ID to reply to.
+      
+      // Since we refactored, we need to be careful. 
+      // Let's catch parsing errors inside parseMessage or here.
+      // The original code created an error response.
+      
+      // Ideally, we need the ID to send the error back.
+      // If parsing failed completely, we can't send an error back with an ID.
+      // But the original code had "command | null" in createErrorResponse.
+      
+      // Let's refine this structure in the helper functions below.
+      // For now, to match the block structure:
+      
+       // NOTE: The implementation below assumes 'command' is available in scope if parsing succeeded.
+       // However, inside this catch block, we don't have access to 'command' from the try block easily
+       // without changing variable scoping.
+       // I will implement the main logic in a way that handles this.
+    }
+  };
+};
+
+// --- Helper Functions ---
+
+const parseMessage = (data: any): Command | null => {
+  let command: Command | null = null;
+
+  if (typeof data === 'string') {
+    const message = JSON.parse(data);
+    if (message.type === 'cancel_task') {
+      const requestId = message.id;
+      callbacks?.onLog(`Received cancel request for: ${requestId}`);
+      const cancelled = geminiExecutor.cancelExecution(requestId);
+      if (!cancelled) {
+        callbacks?.onLog(`Request ${requestId} was not active or already completed`);
+      }
+      return null; // Signal that no further processing is needed
+    }
+    command = message as Command;
+  } else if (data instanceof ArrayBuffer) {
+    const view = new DataView(data);
+    const headerLength = view.getUint32(0, false); // Big Endian
+    const jsonBytes = new Uint8Array(data, 4, headerLength);
+    const jsonStr = new TextDecoder("utf-8").decode(jsonBytes);
+    const metadata = JSON.parse(jsonStr);
+    const binaryData = new Uint8Array(data, 4 + headerLength);
+    
+    command = metadata as Command;
+    if (command && command.payload) {
+        (command.payload as any).data_bytes = binaryData;
+    }
+    console.debug(`Received binary frame. Header len: ${headerLength}, Binary body: ${binaryData.byteLength} bytes.`);
+  } else {
+    throw new Error(`Unsupported WebSocket message type: ${typeof data}`);
+  }
+
+  if (!command) throw new Error("Failed to parse command.");
+  return command;
+};
+
+const sendMessageWithRetry = (message: any, logDescription: string) => {
+  let attempts = 0;
+  const maxAttempts = 5;
+
+  const trySend = () => {
+    try {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(message));
+        // Avoid spamming logs for every stream chunk, but log final/success messages
+        if (!logDescription.startsWith("stream chunk")) {
+             callbacks?.onLog(`Successfully sent ${logDescription}`);
+        }
+        return;
+      }
+    } catch (e) {
+      console.error(`Send failed (${logDescription}), retrying...`, e);
+    }
+
+    if (attempts < maxAttempts) {
+      attempts++;
+      setTimeout(trySend, 200);
+    } else {
+      callbacks?.onLog(`WARNING: Dropped message (${logDescription}) after retries.`);
+    }
+  };
+  
+  trySend();
+};
+
+const sendStreamResponse = (command: Command, payload: any) => {
+  // Log logic
+  if (payload && payload.chunk) {
+    const chunkStr = typeof payload.chunk === 'string' ? payload.chunk : JSON.stringify(payload.chunk);
+    const preview = chunkStr.replace(/\n/g, ' ').substring(0, 60);
+    const ellipsis = chunkStr.length > 60 ? '...' : '';
+    callbacks?.onLog(`[Stream] Chunk: ${preview}${ellipsis}`);
+  } else if (payload && payload.is_finished) {
+     callbacks?.onLog(`[Stream] Finished signal received.`);
+  }
+
+  const response = { id: command.id, payload };
+  // Differentiate log description to avoid spam
+  const desc = (payload as any).is_finished ? `finished signal for ID ${command.id}` : `stream chunk for ID ${command.id}`;
+  sendMessageWithRetry(response, desc);
+};
+
+// Redefined onmessage to use helpers and handle scoping correctly
+const handleWebSocketMessage = async (event: MessageEvent) => {
+    let command: Command | null = null;
+    try {
+        command = parseMessage(event.data);
+        if (!command) return;
+
+        callbacks?.onLog(`Received command: ${command.type} (ID: ${command.id})`);
+        callbacks?.onLog(`Params: ${getSafePayloadLog(command.payload)}`);
+
+        let backendUrl = '';
+        try {
+            const urlObj = new URL(websocketUrl);
+            const protocol = urlObj.protocol === 'wss:' ? 'https:' : 'http:';
+            backendUrl = `${protocol}//${urlObj.host}`;
+        } catch (e) {
+            console.error("Could not parse WebSocket URL", e);
+        }
+
+        if (command.type === 'streamGenerateContent') {
+            await geminiExecutor.execute(command, (payload) => sendStreamResponse(command!, payload), backendUrl);
+            callbacks?.onLog(`Finished streaming for command ID: ${command.id}`);
+        } else {
+            const result = await geminiExecutor.execute(command, () => {}, backendUrl);
+            callbacks?.onLog(`Result: ${getSafePayloadLog(result)}`);
+            const response: ResponsePayload = { 
+                id: command.id, 
+                payload: result, 
+                status: { error: false, code: 200 } 
+            };
+            sendMessageWithRetry(response, `success response for ID ${command.id}`);
+        }
+    } catch (error) {
+        const response = createErrorResponse(error, command);
+        sendMessageWithRetry(response, `error response for ID ${response.id}`);
+    }
+};
+
+// Assign the handler
 const connectInternal = () => {
   if (!websocketUrl || !clientId) {
     callbacks?.onLog('WebSocket URL or Client ID is missing.');
     return;
   }
   ws = new WebSocket(`${websocketUrl}/${clientId}`);
-  // IMPORTANT: Set binaryType to 'arraybuffer' to handle mixed JSON+Binary messages
   ws.binaryType = 'arraybuffer';
   
   callbacks?.onLog(`Connecting to ${websocketUrl}/${clientId}...`);
@@ -126,186 +308,7 @@ const connectInternal = () => {
     callbacks?.onError(event);
   };
 
-  ws.onmessage = async (event) => {
-    let command: Command | null = null;
-    try {
-      // Parse the message based on its type
-      if (typeof event.data === 'string') {
-        // Standard JSON text frame
-        const message = JSON.parse(event.data);
-        
-        // Handle cancel task
-        if (message.type === 'cancel_task') {
-          const requestId = message.id;
-          callbacks?.onLog(`Received cancel request for: ${requestId}`);
-          const cancelled = geminiExecutor.cancelExecution(requestId);
-          if (!cancelled) {
-            callbacks?.onLog(`Request ${requestId} was not active or already completed`);
-          }
-          return;
-        }
-        command = message as Command;
-      } else if (event.data instanceof ArrayBuffer) {
-        // Binary frame: [HeaderLength(Uint32, 4bytes)] + [JSON Metadata] + [Binary Data]
-        // Protocol: Big Endian for header length
-        const view = new DataView(event.data);
-        const headerLength = view.getUint32(0, false); // false = Big Endian (Network Byte Order)
-        
-        const jsonBytes = new Uint8Array(event.data, 4, headerLength);
-        const jsonStr = new TextDecoder("utf-8").decode(jsonBytes);
-        const metadata = JSON.parse(jsonStr);
-        
-        const binaryData = new Uint8Array(event.data, 4 + headerLength);
-        
-        // Construct the command object
-        command = metadata as Command;
-        
-        // Inject the binary data into the payload
-        // We assume 'upload_chunk' commands are the consumers of this binary data
-        if (command && command.payload) {
-            (command.payload as any).data_bytes = binaryData;
-        }
-        
-        console.debug(`Received binary frame. Header len: ${headerLength}, Binary body: ${binaryData.byteLength} bytes.`);
-      } else {
-        throw new Error(`Unsupported WebSocket message type: ${typeof event.data}`);
-      }
-
-      if (!command) throw new Error("Failed to parse command.");
-
-      callbacks?.onLog(`Received command: ${command.type} (ID: ${command.id})`);
-      
-      // --- DEBUG: Log Incoming Payload ---
-      // console.log(`[Request ${command.id}] Payload:`, command.payload);
-      callbacks?.onLog(`Params: ${getSafePayloadLog(command.payload)}`);
-      // -----------------------------------
-
-      const sendResponse = (payload: unknown) => {
-        // --- DEBUG LOGGING FOR STREAMS ---
-        if (command?.type === 'streamGenerateContent') {
-          const p = payload as any;
-          if (p && p.chunk) {
-            // 1. Log full chunk to browser console for detailed inspection
-            // console.log(`[StreamChunk ${command.id}]`, p.chunk);
-            
-            // 2. Log truncated snippet to UI Event Log to avoid spamming/lagging
-            const chunkStr = typeof p.chunk === 'string' ? p.chunk : JSON.stringify(p.chunk);
-            const preview = chunkStr.replace(/\n/g, ' ').substring(0, 60);
-            const ellipsis = chunkStr.length > 60 ? '...' : '';
-            callbacks?.onLog(`[Stream] Chunk: ${preview}${ellipsis}`);
-          } else if (p && p.is_finished) {
-             callbacks?.onLog(`[Stream] Finished signal received.`);
-          }
-        }
-        // ---------------------------------
-
-        const response = { id: command?.id, payload };
-        let attempts = 0;
-        const maxAttempts = 5; // Reduced attempts, faster fail
-
-        const trySend = () => {
-            try {
-                if (ws) {
-                    ws.send(JSON.stringify(response));
-                    // Only log success for the "finished" signal or non-stream to avoid spam
-                    if (command?.type !== 'streamGenerateContent' || (payload as any).is_finished) {
-                        callbacks?.onLog(`Successfully sent response for ID: ${command?.id}`);
-                    }
-                    return; // Success!
-                }
-            } catch (e) {
-                console.error("Send failed, retrying...", e);
-            }
-
-            // Retry logic
-            if (attempts < maxAttempts) {
-                attempts++;
-                setTimeout(trySend, 200); // Faster retry interval (200ms)
-            } else {
-                 callbacks?.onLog(`WARNING: Dropped streaming response for ID ${command?.id}.`);
-            }
-        };
-        
-        trySend();
-      };
-
-      // Calculate backend base URL for handling relative paths in commands
-      let backendUrl = '';
-      try {
-        const urlObj = new URL(websocketUrl);
-        const protocol = urlObj.protocol === 'wss:' ? 'https:' : 'http:';
-        backendUrl = `${protocol}//${urlObj.host}`;
-      } catch (e) {
-        console.error("Could not parse WebSocket URL for backend origin", e);
-      }
-
-      if (command.type === 'streamGenerateContent') {
-        await geminiExecutor.execute(command, sendResponse, backendUrl);
-        callbacks?.onLog(`Finished streaming for command ID: ${command.id}`);
-      } else {
-        const result = await geminiExecutor.execute(command, sendResponse, backendUrl);
-        
-        // --- DEBUG: Log Execution Result ---
-        // console.log(`[Response ${command.id}] Result:`, result);
-        callbacks?.onLog(`Result: ${getSafePayloadLog(result)}`);
-        // -----------------------------------
-        
-        const response: ResponsePayload = { id: command.id, payload: result, status: { error: false, code: 200 } };
-        
-        // Optimistic send logic
-        let attempts = 0;
-        const maxAttempts = 5; 
-        
-        const trySendSuccess = () => {
-             try {
-                if (ws) {
-                    ws.send(JSON.stringify(response));
-                    callbacks?.onLog(`Successfully executed command ID: ${command?.id}`);
-                    return;
-                }
-             } catch (e) {
-                console.error("Send success response failed, retrying...", e);
-             }
-             
-             if (attempts < maxAttempts) {
-                attempts++;
-                setTimeout(trySendSuccess, 200);
-             } else {
-                callbacks?.onLog(`CRITICAL: Could not send success response for ID ${command?.id} after retries.`);
-             }
-        };
-        trySendSuccess();
-      }
-    } catch (error) {
-      const response = createErrorResponse(error, command);
-      const responseId = response.id;
-      
-      // Optimistic send for error response
-      let attempts = 0;
-      const maxAttempts = 5;
-      
-      const trySendError = () => {
-        try {
-            if (ws) {
-                ws.send(JSON.stringify(response));
-                callbacks?.onLog(`Sent error response for command ID: ${responseId}`);
-                return;
-            }
-        } catch (e) {
-            console.error("Send error response failed, retrying...", e);
-        }
-        
-        if (attempts < maxAttempts) {
-            attempts++;
-            setTimeout(trySendError, 200);
-        } else {
-            console.error("Failed to send error response via WebSocket:", response);
-            callbacks?.onLog(`CRITICAL: Could not send error response for ID ${responseId}.`);
-        }
-      };
-      trySendError();
-    }
-  };
+  ws.onmessage = handleWebSocketMessage;
 };
 
 const connect = (url: string, id: string, cbs: ConnectionCallbacks) => {
