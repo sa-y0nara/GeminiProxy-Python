@@ -57,6 +57,19 @@ class Settings(BaseSettings):
     MAX_BINARY_SIZE_MB: int = 512  # WebSocket 二进制传输最大大小（MB）
     SESSION_EXPIRATION_HOURS: int = 1  # 上传会话过期时间（小时）
 
+    # ===========================
+    # 安全配置
+    # ===========================
+    DOWNLOAD_TOKEN_SECRET: str = "change-me-in-production"  # 内部下载令牌密钥
+    DOWNLOAD_TOKEN_TTL: int = 300  # 下载令牌有效期（秒）
+
+    # ===========================
+    # 常量配置
+    # ===========================
+    SHA256_SHORT_LENGTH: int = 8       # 日志显示的短哈希长度
+    SHA256_ALIAS_LENGTH: int = 32      # 文件别名的短哈希长度
+    FILE_VERIFY_CONCURRENCY: int = 10  # 文件验证并发数
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"  # 忽略未定义的环境变量
     )

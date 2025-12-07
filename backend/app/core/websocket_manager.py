@@ -428,15 +428,21 @@ class ConnectionManager:
                         
                         new_file, new_client_id = await file_sync_service.synchronously_rebuild_file(self, sha256_to_reset)
                         
-                        # 更新 payload 中的文件名
-                        # (此处简化处理，假设只有一个文件需要更新)
-                        # TODO: 更好的 payload 递归更新
+                        # 更新 payload 中的文件 URI（递归更新所有匹配的引用）
+                        new_file_uri = new_file.get("uri") or new_file.get("name")
+                        if new_file_uri and original_file_name:
+                            effective_payload = payload_service.update_file_uri_in_payload(
+                                effective_payload,
+                                original_file_name,
+                                new_file_uri,
+                                request_id,
+                            )
                         
                         # 重新注册请求到新客户端
                         self.request_manager.register_request(request_id, new_client_id)
                         return await self.proxy_request(
                             command_type=command_type,
-                            payload=payload,
+                            payload=effective_payload,
                             request=request,
                             request_id=request_id,
                             is_streaming=is_streaming,

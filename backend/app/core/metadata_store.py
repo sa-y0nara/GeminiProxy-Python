@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Set, List
 
+from app.core.config import settings
 from app.core.log_utils import Logger
 
 ISO_TIMESTAMP_RE = re.compile(
@@ -58,7 +59,7 @@ class MetadataStore:
             size_bytes=size_bytes,
         )
         self.metadata_store[sha256] = entry
-        short_sha = sha256[:32]
+        short_sha = sha256[:settings.SHA256_ALIAS_LENGTH]
         self.register_aliases(
             sha256,
             sha256,
@@ -75,7 +76,7 @@ class MetadataStore:
         if not entry:
             return None
 
-        short_sha = sha256[:32]
+        short_sha = sha256[:settings.SHA256_ALIAS_LENGTH]
         self._remove_aliases(sha256, short_sha, f"files/{sha256}", f"files/{short_sha}")
         for client_id, data in entry.replication_map.items():
             if "name" in data:

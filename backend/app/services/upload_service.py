@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import base64
 import re
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Tuple, Dict, Set
 
@@ -11,28 +9,32 @@ from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from app.core import manager
-from app.core.config import settings
 from app.core.file_manager import file_manager
 from app.core.log_utils import Logger
-from app.core.mime_utils import MimeUtils
-from app.schemas.gemini_files import File, UploadFileResponse, InitialUploadRequest # Import if needed
+from app.core.utils import parse_int_safe, first_non_empty, encode_sha256_base64
+from app.schemas.gemini_files import File, InitialUploadRequest
 
-FILENAME_RE = re.compile(r'filename[*]?=["\\"]?([^"\\\';\s]+)')
+# 导入新模块
+from app.services.file_resolver import file_resolver, FILENAME_RE
+from app.services.response_builder import response_builder
+
+
 
 class UploadService:
     def __init__(self):
         pass
 
+    # =========================================================================
+    # 代理方法 - 委托给新模块（保持向后兼容）
+    # =========================================================================
+
     def _parse_int_safe(self, value: Any, default: Optional[int] = None, label: str = "value") -> Optional[int]:
-        """安全地将值转换为整数，带验证和日志"""
-        if value is None:
-            return default
-        try:
-            result = int(value)
-            return result
-        except (TypeError, ValueError):
-            Logger.warning(f"{label} 无法转换为整数", value=value)
-            return default
+        """代理到 utils.parse_int_safe"""
+        return parse_int_safe(value, default, label)
+
+    def _first_non_empty(self, mapping: Optional[dict], *keys: str) -> Optional[str]:
+        """代理到 utils.first_non_empty"""
+        return first_non_empty(mapping, *keys)
 
     def _extract_file_payload(self, response: Optional[dict]) -> Optional[dict]:
         if isinstance(response, dict):
@@ -43,82 +45,32 @@ class UploadService:
         return None
 
     def _determine_proxy_base_url(self, request: Optional[Request]) -> Optional[str]:
-        if request is not None:
-            return str(request.base_url).rstrip("/")
-        base = (settings.PROXY_BASE_URL or "").strip()
-        return base.rstrip("/") if base else None
-
+        """代理到 response_builder.determine_proxy_base_url"""
+        return response_builder.determine_proxy_base_url(request)
 
     def _build_proxy_uris(self, base_url: str, file_name: str) -> Tuple[str, str]:
-        normalized_name = file_name.lstrip("/")
-        if not normalized_name.startswith("files/"):
-            normalized_name = f"files/{normalized_name}"
-        metadata_uri = f"{base_url}/v1beta/{normalized_name}"
-        download_uri = f"{metadata_uri}:download"
-        return metadata_uri, download_uri
-
-    def _first_non_empty(self, mapping: Optional[dict], *keys: str) -> Optional[str]:
-        if not mapping:
-            return None
-        for key in keys:
-            value = mapping.get(key)
-            if value:
-                return value
-        return None
+        """代理到 response_builder.build_proxy_uris"""
+        return response_builder.build_proxy_uris(base_url, file_name)
 
     def _sanitize_filename_hint(self, filename_hint: Optional[str]) -> str:
-        """Sanitize filename to prevent directory traversal attacks."""
-        if not filename_hint:
-            return f"upload_{uuid.uuid4().hex}"
-        
-        sanitized = filename_hint.strip()
-        sanitized = sanitized.replace("\\\\", "_").replace("/", "_").replace("..", "_")
-        
-        while sanitized.startswith("."):
-            sanitized = sanitized[1:]
-        
-        if not sanitized or len(sanitized) == 0:
-            return f"upload_{uuid.uuid4().hex}"
-        
-        return sanitized
+        """代理到 file_resolver.sanitize_filename_hint"""
+        return file_resolver.sanitize_filename_hint(filename_hint)
 
     def _default_file_payload(self, entry, sha256: str, *, size_bytes: int) -> dict:
-        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
-        fallback_name = f"files/{sha256}"
-        return {
-            "name": fallback_name,
-            "displayName": entry.original_filename or "untitled",
-            "mimeType": entry.mime_type or "application/octet-stream",
-            "sizeBytes": str(size_bytes),
-            "createTime": now,
-            "updateTime": now,
-            "sha256Hash": self.encode_sha256_base64(sha256) or sha256,
-            "uri": fallback_name,
-            "state": "ACTIVE",
-            "source": "UPLOADED",
-        }
+        """代理到 response_builder.default_file_payload"""
+        return response_builder.default_file_payload(entry, sha256, size_bytes=size_bytes)
+
+
 
     def prepare_file_for_response(self, file_data: File | dict, request: Optional[Request]) -> File:
-        file_obj = file_data if isinstance(file_data, File) else File.model_validate(file_data)
-        base_url = self._determine_proxy_base_url(request)
-
-        if base_url:
-            metadata_uri, download_uri = self._build_proxy_uris(base_url, file_obj.name)
-            file_obj = file_obj.model_copy(update={"uri": metadata_uri, "download_uri": download_uri})
-        elif not file_obj.download_uri and file_obj.uri:
-            file_obj = file_obj.model_copy(update={"download_uri": file_obj.uri})
-
-        return file_obj
+        """代理到 response_builder.prepare_file_for_response"""
+        return response_builder.prepare_file_for_response(file_data, request)
 
     def encode_sha256_base64(self, sha256_hex: Optional[str]) -> Optional[str]:
-        """将十六进制 sha256 转换为 base64 字符串"""
-        if not sha256_hex:
-            return None
-        try:
-            return base64.b64encode(bytes.fromhex(sha256_hex)).decode("ascii")
-        except ValueError:
-            Logger.warning("无法转换 sha256 为 base64", sha256=sha256_hex)
-            return None
+        """代理到 utils.encode_sha256_base64"""
+        return encode_sha256_base64(sha256_hex)
+
+
 
     def enforce_size_consistency(
         self,
@@ -177,10 +129,10 @@ class UploadService:
             file_manager.upload_sessions.pop(session_id, None)
 
     def _ensure_not_deleted(self, name: str, sha256: Optional[str]):
-        """确保请求的文件未被标记为已删除。"""
-        if file_manager.is_name_marked_deleted(name):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-        if sha256 and file_manager.is_marked_deleted(sha256):
+        """确保请求的文件未被标记为已删除（代理到 file_manager）"""
+        try:
+            file_manager.ensure_not_deleted(name, sha256)
+        except ValueError:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
 
     def _ensure_unique_entry(self, sha256: str, request_id: str):
@@ -204,49 +156,10 @@ class UploadService:
         file_path: Path,
         request_id: str,
     ) -> Tuple[str, str]:
-        normalized_hint = MimeUtils.normalize_filename(filename_hint)
-        metadata_filename = MimeUtils.normalize_filename(
-            self._first_non_empty(metadata, "display_name", "displayName", "filename", "fileName")
+        """代理到 file_resolver.resolve_filename_and_mime"""
+        return file_resolver.resolve_filename_and_mime(
+            sha256, metadata, filename_hint, content_type_hint, file_path, request_id
         )
-        valid_names = [
-            name
-            for name in [normalized_hint, metadata_filename]
-            if name and name.lower() not in {"untitled", "unknown", "unknown_file"}
-        ]
-        final_filename = valid_names[0] if valid_names else None
-
-        header_mime = None
-        if content_type_hint:
-            header_mime = content_type_hint.split(";")[0].strip().lower()
-            if header_mime == "application/octet-stream":
-                header_mime = None
-
-        metadata_mime = self._first_non_empty(metadata, "mime_type", "mimeType")
-        if isinstance(metadata_mime, str):
-            metadata_mime = metadata_mime.strip().lower()
-
-        detected_mime = MimeUtils.detect_mime_type_from_content(file_path)
-        inferred_mime_from_name = MimeUtils.infer_mime_type(final_filename) if final_filename else None
-
-        candidate_mimes = [
-            header_mime,
-            metadata_mime,
-            detected_mime,
-            inferred_mime_from_name,
-        ]
-        final_mime = next((mime for mime in candidate_mimes if mime), "application/octet-stream")
-
-        if not final_filename:
-            final_filename = MimeUtils.build_fallback_filename(sha256, final_mime)
-            Logger.info(f"使用基于类型的临时文件名: {final_filename}", request_id=request_id)
-        else:
-            suffix = Path(final_filename).suffix
-            if not suffix:
-                extension = MimeUtils.guess_extension_from_mime(final_mime, default="")
-                if extension:
-                    final_filename = f"{final_filename}{extension}"
-
-        return final_filename, final_mime
 
 
     async def _sync_to_gemini(

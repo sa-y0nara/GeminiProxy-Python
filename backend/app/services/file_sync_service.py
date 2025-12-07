@@ -199,7 +199,7 @@ class FileSyncService:
         if not to_verify:
             return
         
-        semaphore = asyncio.Semaphore(10)
+        semaphore = asyncio.Semaphore(settings.FILE_VERIFY_CONCURRENCY)
         
         async def verify_with_semaphore(sha256: str, remote_name: str):
             async with semaphore:

@@ -134,6 +134,22 @@ class FileManager:
     def is_name_marked_deleted(self, name: Optional[str]) -> bool:
         return self.metadata.is_name_marked_deleted(name)
 
+    def ensure_not_deleted(self, name: str, sha256: Optional[str] = None) -> None:
+        """确保请求的文件未被标记为已删除，否则抛出异常
+        
+        Args:
+            name: 文件名
+            sha256: 文件的 SHA256 哈希值（可选）
+            
+        Raises:
+            ValueError: 如果文件被标记为已删除
+        """
+        if self.is_name_marked_deleted(name):
+            raise ValueError("File is marked as deleted")
+        if sha256 and self.is_marked_deleted(sha256):
+            raise ValueError("File is marked as deleted")
+
+
     # --- 清理任务 ---
 
     def _collect_ttl_expired_files(self, now: datetime) -> list[str]:

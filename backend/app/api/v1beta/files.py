@@ -12,6 +12,8 @@ from app.core import manager
 from app.core.config import settings
 from app.core.file_manager import file_manager
 from app.core.log_utils import Logger
+from app.core.token_service import token_service
+from app.core.utils import parse_int_safe
 from app.schemas.gemini_files import (
     File,
     InitialUploadRequest,
@@ -33,18 +35,13 @@ router = APIRouter(tags=["Files"])
 upload_router = APIRouter(tags=["Files"])
 
 
-# --- Helper functions moved to UploadService or are now internal to this file ---
+# --- Helper functions ---
 
 def _parse_int_safe(value: Any, default: Optional[int] = None, label: str = "value") -> Optional[int]:
-    """安全地将值转换为整数，带验证和日志"""
-    if value is None:
-        return default
-    try:
-        result = int(value)
-        return result
-    except (TypeError, ValueError):
-        Logger.warning(f"{label} 无法转换为整数", value=value)
-        return default
+    """代理到 utils.parse_int_safe"""
+    return parse_int_safe(value, default, label)
+
+
 
 
 def _build_download_response(
@@ -76,11 +73,12 @@ def _resolve_cached_entry_or_404(
 
 
 def _ensure_not_deleted(name: str, sha256: Optional[str]):
-    """确保请求的文件未被标记为已删除。"""
-    if file_manager.is_name_marked_deleted(name):
+    """确保请求的文件未被标记为已删除（代理到 file_manager）"""
+    try:
+        file_manager.ensure_not_deleted(name, sha256)
+    except ValueError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-    if sha256 and file_manager.is_marked_deleted(sha256):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+
 
 
 async def _prepare_remote_file(
@@ -192,10 +190,15 @@ async def download_file(name: str):
     include_in_schema=False,
 )
 async def internal_download_file(sha256: str, token: str):
+    """供 WebSocket 客户端下载文件内容以进行上传。
+    
+    使用 HMAC-SHA256 签名令牌进行安全验证。
     """
-    供 WebSocket 客户端下载文件内容以进行上传。
-    TODO: 需要实现安全的令牌验证机制。
-    """
+    # 安全令牌验证
+    if not token_service.validate_download_token(sha256, token):
+        Logger.warning("内部下载令牌验证失败", sha256=sha256[:8] if sha256 else None)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid or expired download token.")
+    
     entry = _resolve_cached_entry_or_404(
         sha256,
         missing_identifier_detail="File not found in cache.",

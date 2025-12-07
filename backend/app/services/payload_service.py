@@ -215,4 +215,95 @@ class PayloadService:
                 return cached_entry.original_filename
         return None
 
+    def update_file_uri_in_payload(
+        self,
+        payload: Any,
+        old_file_name: str,
+        new_file_uri: str,
+        request_id: str,
+    ) -> Any:
+        """递归更新 payload 中匹配的文件 URI
+
+        用于在文件重建后更新 payload 中的文件引用。
+
+        Args:
+            payload: 原始 payload
+            old_file_name: 旧的文件名（用于匹配）
+            new_file_uri: 新的文件 URI
+            request_id: 请求 ID（用于日志）
+
+        Returns:
+            更新后的 payload
+        """
+        if not isinstance(payload, dict):
+            return payload
+
+        updated = False
+
+        def update_file_data(file_data: dict) -> bool:
+            """更新单个 fileData 对象，返回是否更新"""
+            nonlocal updated
+            for uri_key in ("fileUri", "file_uri"):
+                current_uri = file_data.get(uri_key)
+                if current_uri and self._uri_matches(current_uri, old_file_name):
+                    file_data[uri_key] = new_file_uri
+                    # 清理可能过时的 fileName
+                    file_data.pop("fileName", None)
+                    file_data.pop("file_name", None)
+                    updated = True
+                    Logger.debug(
+                        "更新 payload 中的文件 URI",
+                        request_id=request_id,
+                        old_uri=current_uri,
+                        new_uri=new_file_uri,
+                    )
+                    return True
+            return False
+
+        def traverse(obj: Any):
+            """递归遍历并更新"""
+            if isinstance(obj, dict):
+                # 检查当前字典是否是 fileData
+                if "fileUri" in obj or "file_uri" in obj:
+                    update_file_data(obj)
+                # 递归遍历子项
+                for value in obj.values():
+                    traverse(value)
+            elif isinstance(obj, list):
+                for item in obj:
+                    traverse(item)
+
+        # 深拷贝 payload 以避免修改原始对象
+        import copy
+        result = copy.deepcopy(payload)
+        traverse(result)
+
+        if updated:
+            Logger.info(
+                "已更新 payload 中的文件引用",
+                request_id=request_id,
+                old_file_name=old_file_name,
+                new_uri=new_file_uri,
+            )
+
+        return result
+
+    def _uri_matches(self, uri: str, file_name: str) -> bool:
+        """检查 URI 是否匹配文件名"""
+        if not uri or not file_name:
+            return False
+        # 直接匹配
+        if uri == file_name:
+            return True
+        # 检查是否以文件名结尾（考虑 files/ 前缀）
+        if uri.endswith(f"/{file_name}") or uri.endswith(f"files/{file_name}"):
+            return True
+        # 通过 sha256 匹配
+        sha256_from_uri = file_manager.get_sha256_by_filename(uri)
+        sha256_from_name = file_manager.get_sha256_by_filename(file_name)
+        if sha256_from_uri and sha256_from_name and sha256_from_uri == sha256_from_name:
+            return True
+        return False
+
+
 payload_service = PayloadService()
