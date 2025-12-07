@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { geminiExecutor } from './geminiExecutor/geminiExecutor';
-import { websocketService } from './websocketService';
+
+// Import hooks
+import { useEventLogs } from './hooks/useEventLogs';
+import { useWebSocket } from './hooks/useWebSocket';
 
 // Import components
 import ConnectionSettings from './components/ConnectionSettings';
@@ -20,66 +23,27 @@ const generateNewClientId = () => {
 };
 
 const App = () => {
+  // Settings State
   const [clientId, setClientId] = useState('');
   const [websocketUrl, setWebsocketUrl] = useState('');
-  const [isConnected, setIsConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
-  const [reconnectionInfo, setReconnectionInfo] = useState<{ attempt: number, max: number } | null>(null);
-  const [reconnectFailed, setReconnectFailed] = useState(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  
+  // Test State
   const [testStatus, setTestStatus] = useState<TestStatus>('idle');
   const testStatusTimeoutRef = useRef<number | null>(null);
 
+  // Custom Hooks
+  const { logs, addLog, clearLogs } = useEventLogs();
+  const { 
+    isConnected, 
+    isConnecting, 
+    reconnectionInfo, 
+    reconnectFailed, 
+    connect, 
+    disconnect 
+  } = useWebSocket(addLog);
 
-  const addLog = useCallback((message: string) => {
-    const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-    setLogs((prevLogs) => [`[${timestamp}] ${message}`, ...prevLogs.slice(0, 199)]);
-  }, []);
-  
-  const clearLogs = () => {
-    setLogs([]);
-  };
-
-  const connectApp = useCallback((urlToConnect: string, idToConnect: string) => {
-    if (!urlToConnect || !idToConnect) {
-      addLog("Connection settings are missing. Cannot connect.");
-      return;
-    }
-    addLog(`Initializing connection for Client ID: ${idToConnect}`);
-    setIsConnecting(true);
-    setReconnectFailed(false);
-    setReconnectionInfo(null);
-
-    websocketService.connect(urlToConnect, idToConnect, {
-      onOpen: () => {
-        setIsConnected(true);
-        setIsConnecting(false);
-        setReconnectionInfo(null);
-        setReconnectFailed(false);
-      },
-      onClose: () => {
-        setIsConnected(false);
-        setIsConnecting(false);
-      },
-      onError: () => {/* UI state change handled by onClose */},
-      onLog: addLog,
-      onReconnecting: (attempt, max) => {
-        setIsConnected(false);
-        setIsConnecting(false);
-        setReconnectionInfo({ attempt, max });
-        setReconnectFailed(false);
-      },
-      onReconnectSuccess: () => addLog("Successfully reconnected to the backend."),
-      onReconnectFailed: () => {
-        setIsConnecting(false);
-        setReconnectionInfo(null);
-        setReconnectFailed(true);
-      },
-    });
-  }, [addLog]);
-
-  // Effect for initial setup and cleanup
+  // Initialization Effect
   useEffect(() => {
     // --- Client ID Initialization ---
     let idToUse: string;
@@ -108,7 +72,7 @@ const App = () => {
     setWebsocketUrl(urlToUse);
     
     // --- Initial Connection ---
-    connectApp(urlToUse, idToUse);
+    connect(urlToUse, idToUse);
     
     // Cleanup timeout on component unmount
     return () => {
@@ -116,7 +80,7 @@ const App = () => {
         clearTimeout(testStatusTimeoutRef.current);
       }
     };
-  }, [addLog, connectApp]); // Dependencies are stable due to useCallback
+  }, [addLog, connect]);
 
   const handleClientIdChange = (newId: string) => {
     setClientId(newId);
@@ -139,14 +103,12 @@ const App = () => {
 
     if (isConnectingOrReconnecting) {
         addLog("Connection attempt cancelled by user.");
-        websocketService.disconnect();
-        setIsConnecting(false);
-        setReconnectionInfo(null);
+        disconnect();
     } else if (isConnected) {
-        websocketService.disconnect();
+        disconnect();
     } else { // Disconnected or Failed
         addLog("Manual connection attempt initiated.");
-        connectApp(websocketUrl, clientId);
+        connect(websocketUrl, clientId);
     }
   };
 
