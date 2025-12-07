@@ -1,21 +1,19 @@
-from __future__ import annotations
 
-import re
 import uuid
 from pathlib import Path
-from typing import Any, Optional, Tuple, Dict, Set
+from typing import Optional, Tuple, List, Set
 
 from fastapi import HTTPException, Request, Response, status
-from fastapi.responses import JSONResponse
+
 
 from app.core import manager
-from app.core.file_manager import file_manager
+from app.core.file_manager import file_manager, FileCacheEntry
 from app.core.log_utils import Logger
-from app.core.utils import parse_int_safe, first_non_empty, encode_sha256_base64
+from app.core.utils import parse_int_safe, first_non_empty
 from app.schemas.gemini_files import File, InitialUploadRequest
 
 # 导入新模块
-from app.services.file_resolver import file_resolver, FILENAME_RE
+from app.services.file_resolver import file_resolver
 from app.services.response_builder import response_builder
 
 
@@ -25,52 +23,8 @@ class UploadService:
         pass
 
     # =========================================================================
-    # 代理方法 - 委托给新模块（保持向后兼容）
+    # 辅助方法
     # =========================================================================
-
-    def _parse_int_safe(self, value: Any, default: Optional[int] = None, label: str = "value") -> Optional[int]:
-        """代理到 utils.parse_int_safe"""
-        return parse_int_safe(value, default, label)
-
-    def _first_non_empty(self, mapping: Optional[dict], *keys: str) -> Optional[str]:
-        """代理到 utils.first_non_empty"""
-        return first_non_empty(mapping, *keys)
-
-    def _extract_file_payload(self, response: Optional[dict]) -> Optional[dict]:
-        if isinstance(response, dict):
-            file_payload = response.get("file")
-            if isinstance(file_payload, dict):
-                return file_payload
-            return response
-        return None
-
-    def _determine_proxy_base_url(self, request: Optional[Request]) -> Optional[str]:
-        """代理到 response_builder.determine_proxy_base_url"""
-        return response_builder.determine_proxy_base_url(request)
-
-    def _build_proxy_uris(self, base_url: str, file_name: str) -> Tuple[str, str]:
-        """代理到 response_builder.build_proxy_uris"""
-        return response_builder.build_proxy_uris(base_url, file_name)
-
-    def _sanitize_filename_hint(self, filename_hint: Optional[str]) -> str:
-        """代理到 file_resolver.sanitize_filename_hint"""
-        return file_resolver.sanitize_filename_hint(filename_hint)
-
-    def _default_file_payload(self, entry, sha256: str, *, size_bytes: int) -> dict:
-        """代理到 response_builder.default_file_payload"""
-        return response_builder.default_file_payload(entry, sha256, size_bytes=size_bytes)
-
-
-
-    def prepare_file_for_response(self, file_data: File | dict, request: Optional[Request]) -> File:
-        """代理到 response_builder.prepare_file_for_response"""
-        return response_builder.prepare_file_for_response(file_data, request)
-
-    def encode_sha256_base64(self, sha256_hex: Optional[str]) -> Optional[str]:
-        """代理到 utils.encode_sha256_base64"""
-        return encode_sha256_base64(sha256_hex)
-
-
 
     def enforce_size_consistency(
         self,
@@ -85,8 +39,8 @@ class UploadService:
     ):
         """校验声明的文件大小与实际写入大小是否一致"""
         declared_size = metadata.get("size_bytes") or metadata.get("sizeBytes")
-        declared_size_int = self._parse_int_safe(declared_size, label="sizeBytes")
-        header_size_int = self._parse_int_safe(header_size, label="Content-Length") if check_header else None
+        declared_size_int = parse_int_safe(declared_size, label="sizeBytes")
+        header_size_int = parse_int_safe(header_size, label="Content-Length") if check_header else None
 
         mismatch_errors = []
         if declared_size_int is not None and declared_size_int != actual_size:
@@ -114,27 +68,6 @@ class UploadService:
                 detail="; ".join(mismatch_errors),
             )
 
-    def parse_filename_from_headers(self, *headers: Optional[str]) -> Optional[str]:
-        """从若干 HTTP 头中提取文件名。"""
-        for header in headers:
-            if not header:
-                continue
-            match = FILENAME_RE.search(header)
-            if match:
-                return match.group(1)
-        return None
-
-    def _clear_upload_session(self, session_id: Optional[str]):
-        if session_id:
-            file_manager.upload_sessions.pop(session_id, None)
-
-    def _ensure_not_deleted(self, name: str, sha256: Optional[str]):
-        """确保请求的文件未被标记为已删除（代理到 file_manager）"""
-        try:
-            file_manager.ensure_not_deleted(name, sha256)
-        except ValueError:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
-
     def _ensure_unique_entry(self, sha256: str, request_id: str):
         entry = file_manager.get_metadata_entry(sha256)
         if entry and file_manager.is_marked_deleted(sha256):
@@ -147,26 +80,11 @@ class UploadService:
             return None
         return entry
 
-    def _resolve_filename_and_mime(
-        self,
-        sha256: str,
-        metadata: dict,
-        filename_hint: Optional[str],
-        content_type_hint: Optional[str],
-        file_path: Path,
-        request_id: str,
-    ) -> Tuple[str, str]:
-        """代理到 file_resolver.resolve_filename_and_mime"""
-        return file_resolver.resolve_filename_and_mime(
-            sha256, metadata, filename_hint, content_type_hint, file_path, request_id
-        )
-
-
     async def _sync_to_gemini(
         self,
         *,
         sha256: str,
-        entry,
+        entry: FileCacheEntry,
         request: Request,
         request_id: str,
         size_bytes: int,
@@ -184,7 +102,7 @@ class UploadService:
             allow_deleted=True,
         )
         if remote_file:
-            return self.build_file_response(remote_file, entry, size_bytes)
+            return response_builder.build_file_response(remote_file, entry, size_bytes)
 
         file_manager.update_replication_status(
             sha256,
@@ -192,13 +110,13 @@ class UploadService:
             "synced",
             gemini_file,
         )
-        return self.build_file_response(gemini_file, entry, size_bytes)
+        return response_builder.build_file_response(gemini_file, entry, size_bytes)
 
 
-    def _handle_offline_fallback(self, *, sha256: str, entry, request_id: str) -> dict:
+    def _handle_offline_fallback(self, *, sha256: str, entry: FileCacheEntry, request_id: str) -> dict:
         Logger.warning("没有可用的WebSocket客户端连接，但文件已保存到本地缓存", request_id=request_id)
         try:
-            local_file_data = self._default_file_payload(entry, sha256, size_bytes=entry.size_bytes)
+            local_file_data = response_builder.default_file_payload(entry, sha256, size_bytes=entry.size_bytes)
             file_manager.update_replication_status(sha256, "local", "synced", local_file_data)
             Logger.api_response(request_id, "文件已保存到本地缓存（离线模式）")
             return local_file_data
@@ -220,91 +138,8 @@ class UploadService:
                 if chunk:
                     yield chunk
 
-        temp_name = self._sanitize_filename_hint(filename_hint)
+        temp_name = file_resolver.sanitize_filename_hint(filename_hint)
         return await file_manager.save_stream_to_cache(iterator(), temp_name)
-
-
-    def map_frontend_response_to_file_model(self, frontend_file: Optional[dict], entry, size_bytes: int) -> dict:
-        """
-        将前端返回的文件对象映射到后端File模型期望的格式
-
-        Args:
-            frontend_file: 前端返回的文件对象
-            entry: 文件缓存条目，包含原始文件信息
-            size_bytes: 文件大小
-
-        Returns:
-            符合File模型格式的字典
-        """
-        frontend_file = frontend_file or {}
-
-        base_payload = self._default_file_payload(entry, entry.sha256, size_bytes=size_bytes)
-        fallback_name = base_payload["name"]
-        sha_base64 = (
-            frontend_file.get("sha256Hash")
-            or frontend_file.get("sha256_hash")
-            or base_payload["sha256Hash"]
-        )
-
-        mapped_file = {
-            **base_payload,
-            "name": frontend_file.get("name") or fallback_name,
-            "sizeBytes": str(frontend_file.get("size", size_bytes)),
-            "uri": frontend_file.get("uri") or fallback_name,
-            "sha256Hash": sha_base64,
-        }
-
-        if frontend_file.get("displayName"):
-            mapped_file["displayName"] = frontend_file["displayName"]
-
-        if "expirationTime" in frontend_file:
-            mapped_file["expirationTime"] = frontend_file["expirationTime"]
-        elif entry.gemini_file_expiration:
-            mapped_file["expirationTime"] = entry.gemini_file_expiration.isoformat().replace('+00:00', 'Z')
-
-        if "downloadUri" in frontend_file:
-            mapped_file["downloadUri"] = frontend_file["downloadUri"]
-
-        return mapped_file
-
-
-    def _build_file_response(
-        self,
-        source_file: Optional[dict],
-        entry,
-        size_bytes: int,
-    ) -> dict:
-        """
-        根据远端返回的数据或本地缓存构造 File 响应。
-        """
-        try:
-            # 尝试直接验证远程文件数据
-            if source_file:
-                return File.model_validate(source_file).model_dump(by_alias=True, exclude_none=True)
-        except Exception as exc:
-            Logger.warning("远程文件数据无法直接验证，将使用本地映射", exc=exc)
-
-        # 如果验证失败或没有 source_file，则使用本地映射
-        mapped_file_data = self.map_frontend_response_to_file_model(source_file, entry, size_bytes)
-        return File.model_validate(mapped_file_data).model_dump(by_alias=True, exclude_none=True)
-
-
-    def build_final_upload_response(self, file_data: File | dict, request: Optional[Request] = None) -> JSONResponse:
-        """
-        构造带有 Google Upload 兼容头部的 JSON 响应
-        """
-        file_obj = self.prepare_file_for_response(file_data, request)
-
-        payload = UploadFileResponse(file=file_obj).model_dump(by_alias=True, exclude_none=True)
-        return JSONResponse(
-            content=payload,
-            headers={
-                "X-Goog-Upload-Status": "final",
-                "Content-Type": "application/json",
-            },
-            status_code=200,
-        )
-
 
     async def _fetch_remote_file_and_update_cache(
         self,
@@ -347,7 +182,7 @@ class UploadService:
             )
             return None, None, False
 
-        remote_file = self._extract_file_payload(response)
+        remote_file = response_builder.extract_file_payload(response)
         if remote_file:
             Logger.info(
                 "远程文件校验成功",
@@ -493,11 +328,12 @@ class UploadService:
         if entry:
             resolved_file = await self._ensure_valid_remote_entry(entry, request=request, request_id=request_id)
             Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]})")
-            self._clear_upload_session(session_id)
+            if session_id:
+                file_manager.upload_sessions.pop(session_id, None)
             file_manager.clear_deleted_flag(sha256)
-            return self.build_final_upload_response(resolved_file, request=request)
+            return response_builder.build_final_upload_response(resolved_file, request=request)
 
-        final_filename, final_mime = self._resolve_filename_and_mime(
+        final_filename, final_mime = file_resolver.resolve_filename_and_mime(
             sha256,
             metadata,
             filename_hint,
@@ -540,15 +376,16 @@ class UploadService:
             Logger.error("上传过程中发生未预期的错误", exc=exc)
             raise HTTPException(status_code=500, detail=f"Upload failed: {str(exc)}")
         finally:
-            self._clear_upload_session(session_id)
+            if session_id:
+                file_manager.upload_sessions.pop(session_id, None)
 
         file_manager.clear_deleted_flag(sha256)
-        return self.build_final_upload_response(file_data, request=request)
+        return response_builder.build_final_upload_response(file_data, request=request)
 
 
     async def _ensure_valid_remote_entry(
         self,
-        entry,
+        entry: FileCacheEntry,
         *,
         request: Request,
         request_id: str,
@@ -613,7 +450,7 @@ class UploadService:
                 sha256=sha256[:8],
                 request_id=request_id,
             )
-            fallback_file = self._build_file_response(None, entry, entry.size_bytes)
+            fallback_file = response_builder.build_file_response(None, entry, entry.size_bytes)
             return File.model_validate(fallback_file)
     
     async def initiate_upload_session(self, request: Request, body: InitialUploadRequest) -> Response:
@@ -625,7 +462,7 @@ class UploadService:
         metadata = self._extract_request_metadata(body)
         file_manager.start_upload_session(session_id, client_id, metadata)
 
-        proxy_upload_url = f"{self._determine_proxy_base_url(request)}/v1beta/files/upload/{session_id}"
+        proxy_upload_url = f"{response_builder.determine_proxy_base_url(request)}/v1beta/files/upload/{session_id}"
 
         return Response(
             headers={
@@ -657,7 +494,7 @@ class UploadService:
 
         metadata = dict(session.metadata or {})
 
-        filename_hint = self._first_non_empty(metadata, "display_name", "displayName", "filename", "fileName") or "untitled"
+        filename_hint = first_non_empty(metadata, "display_name", "displayName", "filename", "fileName") or "untitled"
 
         request_id = str(uuid.uuid4())
         Logger.api_request(request_id, f"文件内容上传 | {filename_hint}")
@@ -667,7 +504,7 @@ class UploadService:
         Logger.info(f"文件上传请求 - MIME: {content_type}, 大小: {content_length}", request_id=request_id)
 
         content_disposition = request.headers.get("content-disposition", "")
-        header_filename = self.parse_filename_from_headers(content_disposition)
+        header_filename = file_resolver.parse_filename_from_headers(content_disposition)
         if header_filename:
             filename_hint = header_filename
             Logger.info(f"从请求头中提取文件名: {filename_hint}", request_id=request_id)
@@ -725,7 +562,7 @@ class UploadService:
                 request_id=request_id,
             )
 
-        remote_file = self._extract_file_payload(response_data)
+        remote_file = response_builder.extract_file_payload(response_data)
         if not isinstance(remote_file, dict):
             raise HTTPException(status_code=502, detail="Invalid response from frontend client")
 
@@ -735,7 +572,7 @@ class UploadService:
             file_manager.clear_deleted_flag(entry.sha256)
 
         Logger.api_response(request_id, "metadata-only 文件创建成功")
-        return self.build_final_upload_response(remote_file, request=request)
+        return response_builder.build_final_upload_response(remote_file, request=request)
 
 
 upload_service = UploadService()

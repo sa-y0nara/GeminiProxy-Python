@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 # 引入 UploadService
 from app.services.upload_service import upload_service
+from app.services.response_builder import response_builder
 
 # ============================================================================
 # 路由器配置
@@ -105,7 +106,7 @@ async def _prepare_remote_file(
         allow_deleted=allow_deleted,
     )
     if remote_file:
-        return upload_service.prepare_file_for_response(remote_file, request)
+        return response_builder.prepare_file_for_response(remote_file, request)
 
     if was_deleted and deleted_log_message:
         Logger.info(
@@ -253,7 +254,7 @@ async def list_files(request: Request, params: ListFilesPayload = Depends()):
 
     end_index = start_index + params.page_size
     paginated_files = all_valid_files[start_index:end_index]
-    prepared_files = [upload_service.prepare_file_for_response(file_obj, request) for file_obj in paginated_files]
+    prepared_files = [response_builder.prepare_file_for_response(file_obj, request) for file_obj in paginated_files]
 
     next_page_token = str(end_index) if end_index < len(all_valid_files) else None
 
@@ -299,7 +300,7 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
     for data in entry.replication_map.values():
         if data.get("name") == name and data.get("status") == "synced":
             try:
-                return upload_service.prepare_file_for_response(data, request)
+                return response_builder.prepare_file_for_response(data, request)
             except Exception as exc:
                 Logger.warning(f"文件数据不完整，无法返回: {exc}")
                 continue

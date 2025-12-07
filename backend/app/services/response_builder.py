@@ -4,7 +4,7 @@
 """
 
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.core.log_utils import Logger
 from app.core.utils import encode_sha256_base64
+from app.core.metadata_store import FileCacheEntry
 from app.schemas.gemini_files import File, UploadFileResponse
 
 
@@ -23,6 +24,22 @@ class ResponseBuilder:
     - 构造文件响应对象
     - 处理响应格式转换
     """
+
+    def extract_file_payload(self, response: Optional[dict]) -> Optional[dict]:
+        """从响应中提取文件 payload
+        
+        Args:
+            response: API 响应字典
+            
+        Returns:
+            文件 payload 字典，或 None
+        """
+        if isinstance(response, dict):
+            file_payload = response.get("file")
+            if isinstance(file_payload, dict):
+                return file_payload
+            return response
+        return None
 
     def determine_proxy_base_url(self, request: Optional[Request]) -> Optional[str]:
         """确定代理基础 URL
@@ -55,7 +72,7 @@ class ResponseBuilder:
         download_uri = f"{metadata_uri}:download"
         return metadata_uri, download_uri
 
-    def default_file_payload(self, entry: Any, sha256: str, *, size_bytes: int) -> dict:
+    def default_file_payload(self, entry: FileCacheEntry, sha256: str, *, size_bytes: int) -> dict:
         """构建默认文件 payload
 
         Args:
@@ -103,7 +120,7 @@ class ResponseBuilder:
         return file_obj
 
     def map_frontend_response_to_file_model(
-        self, frontend_file: Optional[dict], entry: Any, size_bytes: int
+        self, frontend_file: Optional[dict], entry: FileCacheEntry, size_bytes: int
     ) -> dict:
         """将前端返回的文件对象映射到后端 File 模型期望的格式
 
@@ -149,7 +166,7 @@ class ResponseBuilder:
     def build_file_response(
         self,
         source_file: Optional[dict],
-        entry: Any,
+        entry: FileCacheEntry,
         size_bytes: int,
     ) -> dict:
         """根据远端返回的数据或本地缓存构造 File 响应
