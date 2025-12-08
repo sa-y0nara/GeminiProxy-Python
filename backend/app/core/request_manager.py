@@ -1,5 +1,5 @@
 import asyncio
-from typing import Dict, Any, Optional, Set
+from typing import Dict, Any, Optional, Set, List
 from app.core.log_utils import Logger
 from app.core.exceptions import ApiException
 from fastapi import HTTPException, status

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Set
 
 from fastapi import HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 
 
 from app.core import manager
