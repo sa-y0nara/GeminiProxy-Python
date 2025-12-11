@@ -94,7 +94,7 @@ class UploadService:
         gemini_file, client_id = await manager.upload_file_from_cache(sha256)
         Logger.api_response(request_id, f"文件同步上传成功 | {client_id}")
 
-        remote_file, _, _ = await self._fetch_remote_file_and_update_cache(
+        remote_file, _, _ = await self.sync_remote_file_to_cache(
             request=request,
             file_name=gemini_file.get("name"),
             request_id=request_id,
@@ -142,7 +142,7 @@ class UploadService:
         temp_name = file_resolver.sanitize_filename_hint(filename_hint)
         return await file_manager.save_stream_to_cache(iterator(), temp_name)
 
-    async def _fetch_remote_file_and_update_cache(
+    async def sync_remote_file_to_cache(
         self,
         *,
         request: Request,
@@ -403,7 +403,7 @@ class UploadService:
         ]
 
         for client_id, remote_name in candidates:
-            remote_file, _, _ = await self._fetch_remote_file_and_update_cache(
+            remote_file, _, _ = await self.sync_remote_file_to_cache(
                 request=request,
                 file_name=remote_name,
                 request_id=request_id,
@@ -428,7 +428,7 @@ class UploadService:
                 sha256=sha256[:8],
                 client_id=client_id,
             )
-            remote_file, _, _ = await self._fetch_remote_file_and_update_cache(
+            remote_file, _, _ = await self.sync_remote_file_to_cache(
                 request=request,
                 file_name=gemini_file.get("name"),
                 request_id=request_id,

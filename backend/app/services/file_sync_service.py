@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Optional, Dict, List, Tuple
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException, status, Request
 
 from app.core.background_tasks import create_background_task
 from app.core.config import settings
@@ -521,6 +521,87 @@ class FileSyncService:
         except Exception as e:
             # 忽略错误，因为最终文件会被 TTL 清理
             Logger.warning("异步远程文件删除失败", exc=e, client_id=client_id, file_name=file_name)
+
+
+
+    async def execute_proxy_request_with_retry(
+        self,
+        manager: IConnectionManager,
+        *,
+        command_type: str,
+        effective_payload: Any,
+        request: Request,
+        request_id: str,
+        client_id: str,
+        is_streaming: bool,
+        original_file_name: Optional[str] = None,
+    ) -> Any:
+        """
+        执行代理请求，并封装了文件过期/未找到时的自动重建与重试逻辑。
+        """
+        from app.services.payload_service import payload_service
+
+        try:
+            return await manager.proxy_request(
+                command_type=command_type,
+                payload=effective_payload,
+                request=request,
+                request_id=request_id,
+                is_streaming=is_streaming,
+            )
+        except Exception as exc:
+            # 检查是否为可恢复的文件错误
+            if not (hasattr(exc, 'is_resettable') and getattr(exc, 'is_resettable', False)):
+                raise
+
+            sha256_to_reset = file_manager.get_sha256_by_filename(original_file_name) if original_file_name else None
+            
+            if not sha256_to_reset:
+                raise
+
+            Logger.error("尝试使用重建的文件重试请求", request_id=request_id)
+            try:
+                # 1. 确保清理旧的请求绑定 (非常重要，否则新请求无法注册)
+                # 注意：这里需要 manager 暴露清理接口，或者我们假设 proxy_request 内部已经清理
+                # 但为了安全，我们再做一次清理操作，但这需要 manager 支持。
+                # 目前 manager.cleanup_request 是 public 的，可以直接调用。
+                if hasattr(manager, "request_manager"):
+                     manager.request_manager.cleanup_request(request_id)
+                
+                # 2. 同步重建文件
+                new_file, new_client_id = await self.synchronously_rebuild_file(manager, sha256_to_reset)
+                
+                # 3. 更新 payload 中的文件 URI
+                new_file_uri = new_file.get("uri") or new_file.get("name")
+                if new_file_uri and original_file_name:
+                    effective_payload = payload_service.update_file_uri_in_payload(
+                        effective_payload,
+                        original_file_name,
+                        new_file_uri,
+                        request_id,
+                    )
+                
+                # 4. 重新注册请求到新客户端
+                if hasattr(manager, "request_manager"):
+                    manager.request_manager.register_request(request_id, new_client_id)
+                
+                # 5. 再次尝试请求
+                return await manager.proxy_request(
+                    command_type=command_type,
+                    payload=effective_payload,
+                    request=request,
+                    request_id=request_id,
+                    is_streaming=is_streaming,
+                )
+            except Exception as rebuild_exc:
+                # 确保清理
+                if hasattr(manager, "request_manager"):
+                    manager.request_manager.cleanup_request(request_id)
+                    
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"File expired, and reconstruction failed: {rebuild_exc}",
+                )
 
 
 file_sync_service = FileSyncService()

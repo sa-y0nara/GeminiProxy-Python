@@ -97,7 +97,7 @@ async def _prepare_remote_file(
     获取远端文件并转为响应对象。
     当 require=True 时，缺失会直接抛出 404，避免额外的样板。
     """
-    remote_file, remote_sha, was_deleted = await upload_service._fetch_remote_file_and_update_cache(
+    remote_file, remote_sha, was_deleted = await upload_service.sync_remote_file_to_cache(
         request=request,
         file_name=file_name,
         request_id=request_id,

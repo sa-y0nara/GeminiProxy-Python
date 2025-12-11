@@ -316,12 +316,20 @@ class ConnectionManager:
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Request to frontend client timed out",
             )
+        except asyncio.CancelledError:
+            # 正常取消（如客户端断开连接）
+            self.request_manager.cleanup_request(request_id)
+            Logger.info("请求已取消", request_id=request_id)
+            # 使用 499 状态码表示 Client Closed Request，避免 uvicorn 报 500
+            # 注意: 499 非标准，但被 Nginx 等广泛使用
+            raise HTTPException(status_code=499, detail="Client Closed Request")
         except ApiException as exc:
             self.request_manager.cleanup_request(request_id)
             self._mark_resettable_if_needed(exc, command, request_id)
             raise HTTPException(status_code=exc.status_code, detail=exc.detail)
         except Exception as exc:
             self.request_manager.cleanup_request(request_id)
+            Logger.error("后端通信异常", exc=exc, request_id=request_id)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=f"Error communicating with frontend client: {exc}",
@@ -399,64 +407,20 @@ class ConnectionManager:
             # 注册请求并绑定到客户端
             self.request_manager.register_request(request_id, client_id)
             
-            # 由于 handle_api_request 没有使用 monitored_proxy_request 上下文管理器，
-            # 我们需要手动管理流式请求的生命周期，或者在这里使用 try/finally 块确保清理
-            # 这里的逻辑稍微有点 tricky：
-            # 如果是流式，proxy_request 返回生成器，生成器结束时需要清理。
-            # 如果是非流式，await response 后清理。
-            
-            # 为了简化，我们调用 proxy_request，它内部会调用 _handle_streaming_request
-            # _handle_streaming_request 返回的 generator 在结束时会清理。
-            
-            return await self.proxy_request(
+            # 使用 FileSyncService 的重试方法执行请求
+            return await file_sync_service.execute_proxy_request_with_retry(
+                self,
                 command_type=command_type,
-                payload=effective_payload,
+                effective_payload=effective_payload,
                 request=request,
                 request_id=request_id,
+                client_id=client_id,
                 is_streaming=is_streaming,
+                original_file_name=original_file_name,
             )
 
-        except Exception as exc:
-            # 错误恢复逻辑
-            if hasattr(exc, 'is_resettable') and getattr(exc, 'is_resettable', False):
-                sha256_to_reset = file_manager.get_sha256_by_filename(original_file_name) if original_file_name else None
-                if sha256_to_reset:
-                    Logger.error("尝试使用重建的文件重试请求", request_id=request_id)
-                    try:
-                        # 清理旧的请求绑定
-                        self.request_manager.cleanup_request(request_id)
-                        
-                        new_file, new_client_id = await file_sync_service.synchronously_rebuild_file(self, sha256_to_reset)
-                        
-                        # 更新 payload 中的文件 URI（递归更新所有匹配的引用）
-                        new_file_uri = new_file.get("uri") or new_file.get("name")
-                        if new_file_uri and original_file_name:
-                            effective_payload = payload_service.update_file_uri_in_payload(
-                                effective_payload,
-                                original_file_name,
-                                new_file_uri,
-                                request_id,
-                            )
-                        
-                        # 重新注册请求到新客户端
-                        self.request_manager.register_request(request_id, new_client_id)
-                        return await self.proxy_request(
-                            command_type=command_type,
-                            payload=effective_payload,
-                            request=request,
-                            request_id=request_id,
-                            is_streaming=is_streaming,
-                        )
-                    except Exception as rebuild_exc:
-                         # 确保清理
-                        self.request_manager.cleanup_request(request_id)
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"File expired, and reconstruction failed: {rebuild_exc}",
-                        )
-            # 发生其他异常也要清理
-            # 注意：流式请求在生成器中抛出异常时也会清理吗？
-            # 如果 proxy_request 抛出异常（比如发送命令失败），我们需要在这里清理
+        except Exception:
+            # 确保清理
             self.request_manager.cleanup_request(request_id)
             raise
 
@@ -473,20 +437,56 @@ class ConnectionManager:
         async def stream_generator() -> AsyncGenerator[Any, None]:
             try:
                 await websocket.send_json(command)
+                
+                # 创建一个断开连接的监控任务
+                disconnect_task = asyncio.create_task(request.is_disconnected())
+                # 创建一个队列获取任务
+                queue_task = asyncio.create_task(queue.get())
+                
+                pending = {disconnect_task, queue_task}
+
                 while True:
-                    if await request.is_disconnected():
-                        Logger.event("DISCONNECT", "流式传输中断", request_id=request_id)
+                    # 等待任意一个任务完成
+                    done, pending = await asyncio.wait(
+                        pending, 
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+                    
+                    if disconnect_task in done:
+                        # 客户端断开连接
+                        Logger.event("DISCONNECT", "流式传输中断，客户端已断开", request_id=request_id)
+                        queue_task.cancel() # 取消正在等待的队列任务
                         break
-
-                    try:
-                        item = await asyncio.wait_for(queue.get(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        continue
-
-                    if item is None:
-                        break
-                    yield item
+                        
+                    if queue_task in done:
+                        # 队列有新数据
+                        try:
+                            item = queue_task.result()
+                        except asyncio.CancelledError:
+                            break
+                        
+                        if item is None:
+                            # 流结束信号
+                            disconnect_task.cancel()
+                            break
+                        
+                        yield item
+                        
+                        # 重新调度下一个队列任务
+                        queue_task = asyncio.create_task(queue.get())
+                        pending.add(queue_task)
+                        
+            except asyncio.CancelledError:
+                Logger.warning("流式生成器被取消", request_id=request_id)
+                raise
+            except Exception as e:
+                Logger.error("流式传输发生异常", exc=e, request_id=request_id)
+                raise
             finally:
+                # 确保所有 pending 任务都被取消
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
                 self.request_manager.cleanup_request(request_id)
 
         return stream_generator()
