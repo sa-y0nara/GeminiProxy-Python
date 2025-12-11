@@ -7,7 +7,7 @@
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple, List
+from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 
 from app.core.config import settings
 from app.core.log_utils import Logger
@@ -153,13 +153,29 @@ class FileManager:
     # --- 清理任务 ---
 
     def _collect_ttl_expired_files(self, now: datetime) -> list[str]:
-        """收集所有 TTL 过期的文件"""
-        return [sha256 for sha256, entry in self.metadata.metadata_store.items()
-                if entry.gemini_file_expiration and now > entry.gemini_file_expiration]
+        """收集所有 TTL 过期的文件
+        
+        Returns:
+            过期文件的 SHA256 列表
+        """
+        expired_files: list[str] = []
+        for sha256, entry in self.metadata.metadata_store.items():
+            # 检查文件是否设置了过期时间且已超时
+            if entry.gemini_file_expiration and now > entry.gemini_file_expiration:
+                expired_files.append(sha256)
+        return expired_files
 
     def _collect_lru_candidates(self, now: datetime, exclude_shas: set) -> list[tuple]:
-        """收集 LRU 清理候选文件"""
-        candidates = []
+        """收集 LRU 清理候选文件
+        
+        Args:
+            now: 当前时间
+            exclude_shas: 要排除的 SHA256 集合（已被 TTL 标记删除的文件）
+            
+        Returns:
+            候选文件列表，每项为 (最后访问时间, sha256, 文件大小) 元组
+        """
+        candidates: list[tuple] = []
         for sha256, entry in self.metadata.metadata_store.items():
             if sha256 not in exclude_shas:
                 candidates.append((entry.last_accessed_at, sha256, entry.size_bytes))
@@ -187,7 +203,11 @@ class FileManager:
     async def periodic_cleanup_task(self):
         """后台定期清理任务，结合 TTL 和 LRU 策略。"""
         while True:
-            await asyncio.sleep(settings.FILE_CACHE_CLEANUP_INTERVAL)
+            try:
+                await asyncio.sleep(settings.FILE_CACHE_CLEANUP_INTERVAL)
+            except asyncio.CancelledError:
+                Logger.info("文件缓存清理任务被取消，正在退出...")
+                break
             Logger.info("开始执行文件缓存清理任务...")
 
             try:
@@ -218,7 +238,7 @@ class FileManager:
                 else:
                     Logger.info("缓存状态正常，无需清理。")
             except Exception as e:
-                Logger.error("缓存清理任务失败", exc=e)
+                Logger.error("缓存清理任务失败", exc=e, context="periodic_cleanup")
 
     def cleanup_all_cache_files(self):
         self.storage.cleanup_all_files()

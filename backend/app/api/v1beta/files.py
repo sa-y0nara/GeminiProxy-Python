@@ -7,7 +7,7 @@ from __future__ import annotations
 """
 
 import uuid
-from typing import Any, Optional
+from typing import Any, Generator, Optional
 from app.core import manager
 from app.core.config import settings
 from app.core.file_manager import file_manager
@@ -22,7 +22,6 @@ from app.schemas.gemini_files import (
 )
 from fastapi import APIRouter, Body, Depends, HTTPException, Path as FastAPIPath, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import ValidationError
 
 # 引入 UploadService
 from app.services.upload_service import upload_service
@@ -35,14 +34,15 @@ from app.services.response_builder import response_builder
 router = APIRouter(tags=["Files"])
 upload_router = APIRouter(tags=["Files"])
 
+# --------------------------------------------------------------------------
+# 错误消息常量
+# --------------------------------------------------------------------------
+
+_ERR_FILE_NOT_FOUND = "File not found."
+_ERR_FILE_NOT_AVAILABLE = "File not available."
+
 
 # --- Helper functions ---
-
-def _parse_int_safe(value: Any, default: Optional[int] = None, label: str = "value") -> Optional[int]:
-    """代理到 utils.parse_int_safe"""
-    return parse_int_safe(value, default, label)
-
-
 
 
 def _build_download_response(
@@ -62,8 +62,8 @@ def _build_download_response(
 def _resolve_cached_entry_or_404(
     sha256: Optional[str],
     *,
-    missing_identifier_detail: str = "File not found.",
-    missing_entry_detail: str = "File not available.",
+    missing_identifier_detail: str = _ERR_FILE_NOT_FOUND,
+    missing_entry_detail: str = _ERR_FILE_NOT_AVAILABLE,
 ):
     if not sha256:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=missing_identifier_detail)
@@ -78,7 +78,7 @@ def _ensure_not_deleted(name: str, sha256: Optional[str]):
     try:
         file_manager.ensure_not_deleted(name, sha256)
     except ValueError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ERR_FILE_NOT_FOUND)
 
 
 
@@ -117,7 +117,7 @@ async def _prepare_remote_file(
         )
 
     if require or was_deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=_ERR_FILE_NOT_FOUND)
 
     return None
 
@@ -177,11 +177,11 @@ async def download_file(name: str):
     sha256 = file_manager.get_sha256_by_filename(name)
     entry = _resolve_cached_entry_or_404(
         sha256,
-        missing_identifier_detail="File not found.",
-        missing_entry_detail="File not available.",
+        missing_identifier_detail=_ERR_FILE_NOT_FOUND,
+        missing_entry_detail=_ERR_FILE_NOT_AVAILABLE,
     )
 
-    Logger.event("PUBLIC_DOWNLOAD", "用户下载文件", sha256=sha256[:8])
+    Logger.event("PUBLIC_DOWNLOAD", "用户下载文件", sha256=sha256[:8] if sha256 else None)
     download_name = entry.original_filename or name.split("/")[-1]
     return _build_download_response(entry, download_name=download_name)
 
@@ -215,6 +215,37 @@ async def internal_download_file(sha256: str, token: str):
 # ============================================================================
 
 
+def _iter_synced_files() -> Generator[File, None, None]:
+    """迭代所有已同步的文件，按创建时间降序
+    
+    提取为模块级函数以避免每次请求重新定义，提高性能和可测试性。
+    """
+    sorted_entries = sorted(
+        file_manager.metadata_store.values(),
+        key=lambda e: e.created_at,
+        reverse=True,
+    )
+    for entry in sorted_entries:
+        replica = next(
+            (
+                data
+                for data in entry.replication_map.values()
+                if data.get("status") == "synced" and data.get("name")
+            ),
+            None,
+        )
+        if not replica:
+            continue
+        try:
+            yield File.model_validate(replica)
+        except Exception as exc:
+            Logger.warning(
+                "复制数据不完整，跳过",
+                sha256=(entry.sha256[:8] if entry.sha256 else None),
+                error=str(exc),
+            )
+
+
 @router.get(
     "/files",
     response_model=ListFilesResponse,
@@ -222,33 +253,10 @@ async def internal_download_file(sha256: str, token: str):
 )
 async def list_files(request: Request, params: ListFilesPayload = Depends()):
     """从后端缓存中列出所有文件。"""
-    def _iter_synced_files():
-        """迭代所有已同步的文件，按创建时间降序"""
-        sorted_entries = sorted(
-            file_manager.metadata_store.values(),
-            key=lambda e: e.created_at,
-            reverse=True,
-        )
-        for entry in sorted_entries:
-            replica = next(
-                (
-                    data
-                    for data in entry.replication_map.values()
-                    if data.get("status") == "synced" and data.get("name")
-                ),
-                None,
-            )
-            if not replica:
-                continue
-            try:
-                yield File.model_validate(replica)
-            except Exception as exc:
-                Logger.warning(f"复制数据不完整，跳过: {exc}")
-
     all_valid_files = list(_iter_synced_files())
 
     # 实现分页
-    start_index = _parse_int_safe(params.page_token, default=0, label="page_token")
+    start_index = parse_int_safe(params.page_token, default=0, label="page_token")
     if start_index < 0:
         start_index = 0
 
@@ -329,20 +337,18 @@ async def delete_file(request: Request, name: str):
 
     sha256 = file_manager.get_sha256_by_filename(name)
     if not sha256:
+        # 幂等删除：文件不存在时返回成功，符合 RESTful DELETE 语义
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
         return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
     entry = file_manager.get_metadata_entry(sha256)
     alias_candidates = {name}
     if entry:
-        alias_candidates.update(
-            {
-                alias
-                for data in entry.replication_map.values()
-                for alias in (data.get("name"), data.get("uri"))
-                if alias
-            }
-        )
+        for data in entry.replication_map.values():
+            if data.get("name"):
+                alias_candidates.add(data["name"])
+            if data.get("uri"):
+                alias_candidates.add(data["uri"])
     file_manager.mark_deleted(sha256, alias_candidates)
     if not entry:
         Logger.api_response(request_id, "文件在本地未找到，视为成功")

@@ -1,13 +1,21 @@
+"""元数据存储模块
+
+负责管理内存中的文件元数据、复制状态。
+使用 AliasManager 和 TombstoneManager 处理别名和删除标记。
+"""
+
 import base64
 import string
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, List
+from typing import Any, Dict, List, Optional, Set
 
+from app.core.alias_manager import AliasManager
 from app.core.config import settings
 from app.core.log_utils import Logger
+from app.core.tombstone_manager import TombstoneManager
 
 ISO_TIMESTAMP_RE = re.compile(
     r"^(?P<date>\d{4}-\d{2}-\d{2})T"
@@ -15,6 +23,7 @@ ISO_TIMESTAMP_RE = re.compile(
     r"(?:\.(?P<frac>\d+))?"
     r"(?P<tz>Z|[+-]\d{2}:\d{2})?$"
 )
+
 
 @dataclass
 class FileCacheEntry:
@@ -29,17 +38,29 @@ class FileCacheEntry:
     gemini_file_expiration: Optional[datetime] = None
     replication_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
+
 class MetadataStore:
+    """元数据存储
+    
+    职责：
+    1. 管理文件元数据条目的 CRUD
+    2. 管理复制状态
+    3. 协调 AliasManager 和 TombstoneManager
     """
-    负责管理内存中的文件元数据、复制状态和反向映射。
-    """
-    def __init__(self, file_cache_dir: Path):
+
+    def __init__(self, file_cache_dir: Path) -> None:
         self.file_cache_dir = file_cache_dir
         self.metadata_store: Dict[str, FileCacheEntry] = {}
-        self.reverse_mapping: Dict[str, str] = {}
-        self.deleted_shas: Set[str] = set()
-        self.deleted_alias_map: Dict[str, str] = {}
+        
+        # 初始化子模块
+        self.alias_manager = AliasManager()
+        self.tombstone_manager = TombstoneManager(self.alias_manager._canonical_aliases)
+        
         Logger.event("INIT", "MetadataStore 初始化")
+
+    # =========================================================================
+    # 条目 CRUD
+    # =========================================================================
 
     def get_entry(self, sha256: str) -> Optional[FileCacheEntry]:
         """获取条目并更新访问时间"""
@@ -51,6 +72,7 @@ class MetadataStore:
     def create_entry(
         self, *, sha256: str, file_path: Path, filename: str, mime_type: Optional[str], size_bytes: int
     ) -> FileCacheEntry:
+        """创建新的元数据条目"""
         entry = FileCacheEntry(
             sha256=sha256,
             local_path=file_path,
@@ -59,122 +81,48 @@ class MetadataStore:
             size_bytes=size_bytes,
         )
         self.metadata_store[sha256] = entry
-        short_sha = sha256[:settings.SHA256_ALIAS_LENGTH]
-        self.register_aliases(
-            sha256,
-            sha256,
-            short_sha,
-            f"files/{sha256}",
-            f"files/{short_sha}",
-        )
+        self.alias_manager.register_standard_aliases(sha256)
         Logger.event("METADATA_CREATE", "创建文件元数据", sha256=sha256)
         return entry
 
     def delete_entry(self, sha256: str) -> Optional[FileCacheEntry]:
-        """删除元数据，清理映射，返回被删除的条目(以便调用者清理物理文件)"""
+        """删除元数据，清理映射，返回被删除的条目"""
         entry = self.metadata_store.pop(sha256, None)
         if not entry:
             return None
 
-        short_sha = sha256[:settings.SHA256_ALIAS_LENGTH]
-        self._remove_aliases(sha256, short_sha, f"files/{sha256}", f"files/{short_sha}")
+        self.alias_manager.remove_standard_aliases(sha256)
         for client_id, data in entry.replication_map.items():
             if "name" in data:
-                self._remove_aliases(data["name"])
+                self.alias_manager.remove_aliases(data["name"])
         
         Logger.event("METADATA_DELETE", "元数据已删除", sha256=sha256)
         return entry
 
+    def get_all_entries(self) -> List[FileCacheEntry]:
+        """获取所有条目"""
+        return list(self.metadata_store.values())
+
+    # =========================================================================
+    # 别名管理 (委托给 AliasManager)
+    # =========================================================================
+
     def get_sha256_by_filename(self, file_name: str) -> Optional[str]:
-        if not file_name:
-            return None
+        """通过文件名查找 sha256"""
+        return self.alias_manager.get_sha256_by_alias(file_name, self.metadata_store)
 
-        mapped = self.reverse_mapping.get(file_name)
-        if mapped:
-            Logger.debug("命中文件别名", alias=file_name, sha256=mapped[:8])
-            return mapped
+    def register_aliases(self, sha256: str, *aliases: str) -> None:
+        """注册文件别名"""
+        self.alias_manager.register_aliases(sha256, *aliases)
 
-        normalized_forms = self._extract_normalized_forms(file_name)
-        for form in normalized_forms:
-            mapped = self.reverse_mapping.get(form)
-            if mapped:
-                Logger.debug("命中文件别名", alias=form, sha256=mapped[:8])
-                return mapped
-
-        result = self._fallback_lookup(file_name, normalized_forms)
-        if result:
-            return result
-
-        Logger.debug("文件别名未找到", alias=file_name)
-        return None
-
-    def register_aliases(self, sha256: str, *aliases: str):
-        for alias in aliases:
-            for normalized in self._canonical_aliases(alias):
-                self.reverse_mapping[normalized] = sha256
-                Logger.debug("注册文件别名", alias=normalized, sha256=sha256[:8])
-
-    def _remove_aliases(self, *aliases: str):
-        for alias in aliases:
-            for normalized in self._canonical_aliases(alias):
-                if self.reverse_mapping.pop(normalized, None):
-                    Logger.debug("移除文件别名", alias=normalized)
-
-    def _canonical_aliases(self, alias: Optional[str]) -> Set[str]:
-        if not alias:
-            return set()
-        token = alias.strip()
-        if not token:
-            return set()
-        
-        variants = {token}
-        if "/" in token:
-            tail = token.rsplit("/", 1)[-1]
-            if tail and tail != token:
-                variants.add(tail)
-        return variants
-
-    def _extract_normalized_forms(self, file_name: str) -> List[str]:
-        forms = []
-        normalized = file_name.strip().split(":download", 1)[0]
-        forms.append(normalized)
-        
-        if "files/" in normalized:
-            suffix = normalized[normalized.index("files/"):]
-            suffix = suffix.split(":download", 1)[0]
-            forms.append(suffix)
-            tail = suffix.split("files/", 1)[-1]
-            if tail:
-                forms.append(tail)
-        
-        candidate = file_name.split('/')[-1].split(":download", 1)[0]
-        if len(candidate) == 64 and all(c in string.hexdigits for c in candidate):
-            if candidate in self.metadata_store:
-                return [candidate]
-        
-        return forms
-
-    def _fallback_lookup(self, file_name: str, normalized_forms: List[str]) -> Optional[str]:
-        fallback_candidates = set(normalized_forms)
-        for sha, entry in self.metadata_store.items():
-            for data in entry.replication_map.values():
-                remote_name = data.get("name")
-                if remote_name and remote_name in fallback_candidates:
-                    Logger.debug("通过 replication_map 找到文件", alias=file_name, sha256=sha[:8])
-                    self.register_aliases(sha, remote_name)
-                    return sha
-                uri = data.get("uri")
-                if uri and "files/" in uri:
-                    uri_tail = uri.split("files/", 1)[-1]
-                    if uri_tail and uri_tail in fallback_candidates:
-                        Logger.debug("通过 uri 找到文件", alias=file_name, sha256=sha[:8])
-                        self.register_aliases(sha, uri, uri_tail)
-                        return sha
-        return None
+    # =========================================================================
+    # 复制状态管理
+    # =========================================================================
 
     def update_replication_status(
         self, sha256: str, client_id: str, status: str, gemini_file: Optional[Dict] = None
-    ):
+    ) -> None:
+        """更新复制状态"""
         entry = self.get_entry(sha256)
         if not entry:
             return
@@ -184,7 +132,7 @@ class MetadataStore:
             replication_data.update(gemini_file)
             file_name = gemini_file.get("name")
             if file_name:
-                self.register_aliases(sha256, file_name)
+                self.alias_manager.register_aliases(sha256, file_name)
             uri_value = gemini_file.get("uri")
             if uri_value:
                 replication_data["uri"] = uri_value
@@ -199,20 +147,26 @@ class MetadataStore:
         entry.replication_map[client_id] = replication_data
         Logger.debug("更新复制状态", sha256=sha256, client_id=client_id, status=status)
 
-    def reset_replication_map(self, sha256: str):
+    def reset_replication_map(self, sha256: str) -> None:
+        """重置复制映射"""
         entry = self.get_entry(sha256)
         if not entry:
             return
         
         for client_id, data in entry.replication_map.items():
             if "name" in data:
-                self.reverse_mapping.pop(data["name"], None)
+                self.alias_manager.reverse_mapping.pop(data["name"], None)
 
         entry.replication_map.clear()
         entry.gemini_file_expiration = None
         Logger.event("REPLICATION_RESET", "文件复制地图已重置", sha256=sha256)
 
+    # =========================================================================
+    # 远程文件处理
+    # =========================================================================
+
     def extract_sha256_hex(self, remote_file: Dict[str, Any]) -> Optional[str]:
+        """从远程文件对象提取 sha256"""
         sha_candidates = (
             remote_file.get("sha256Hash"),
             remote_file.get("sha256_hash"),
@@ -234,6 +188,7 @@ class MetadataStore:
         return None
 
     def ensure_remote_entry(self, remote_file: Dict[str, Any]) -> Optional[FileCacheEntry]:
+        """确保远程文件有对应的元数据条目"""
         sha256_hex = self.extract_sha256_hex(remote_file)
         if not sha256_hex:
             Logger.warning("远程文件缺少 sha256Hash，无法登记", file_name=remote_file.get("name"))
@@ -274,7 +229,32 @@ class MetadataStore:
         Logger.event("METADATA_REMOTE", "创建远程文件元数据占位", sha256=sha256_hex[:8], file_name=remote_file.get("name"))
         return entry
 
+    # =========================================================================
+    # 删除标记 (委托给 TombstoneManager)
+    # =========================================================================
+
+    def mark_deleted(self, sha256: Optional[str], aliases: Optional[Set[str]] = None) -> None:
+        """标记文件为已删除"""
+        self.tombstone_manager.mark_deleted(sha256, aliases)
+
+    def clear_deleted_flag(self, sha256: Optional[str]) -> None:
+        """清除删除标记"""
+        self.tombstone_manager.clear_deleted_flag(sha256)
+
+    def is_marked_deleted(self, sha256: Optional[str]) -> bool:
+        """检查是否被标记为已删除"""
+        return self.tombstone_manager.is_marked_deleted(sha256)
+
+    def is_name_marked_deleted(self, name: Optional[str]) -> bool:
+        """检查名称是否被标记为已删除"""
+        return self.tombstone_manager.is_name_marked_deleted(name)
+
+    # =========================================================================
+    # 工具方法
+    # =========================================================================
+
     def _parse_iso_timestamp(self, value: Optional[str]) -> Optional[datetime]:
+        """解析 ISO 时间戳"""
         if not value:
             return None
         match = ISO_TIMESTAMP_RE.match(value.strip())
@@ -297,56 +277,3 @@ class MetadataStore:
         except ValueError as exc:
             Logger.warning("时间戳解析失败", timestamp=value, exc=exc)
             return None
-
-    # Deletion Flags
-    def mark_deleted(self, sha256: Optional[str], aliases: Optional[Set[str]] = None):
-        if not sha256:
-            return
-        self.deleted_shas.add(sha256)
-        tombstone_aliases: Set[str] = set()
-        tombstone_aliases.update(self._normalize_aliases_for_tombstone(sha256))
-        tombstone_aliases.update(self._normalize_aliases_for_tombstone(f"files/{sha256}"))
-        if aliases:
-            for alias in aliases:
-                tombstone_aliases.update(self._normalize_aliases_for_tombstone(alias))
-        for alias in tombstone_aliases:
-            self.deleted_alias_map[alias] = sha256
-        Logger.debug("标记文件为已删除", sha256=sha256[:8])
-
-    def clear_deleted_flag(self, sha256: Optional[str]):
-        if not sha256:
-            return
-        if sha256 in self.deleted_shas:
-            self.deleted_shas.discard(sha256)
-        aliases_to_remove = [alias for alias, value in self.deleted_alias_map.items() if value == sha256]
-        for alias in aliases_to_remove:
-            self.deleted_alias_map.pop(alias, None)
-        if aliases_to_remove:
-            Logger.debug("清除已删除标记", sha256=sha256[:8])
-
-    def is_marked_deleted(self, sha256: Optional[str]) -> bool:
-        return bool(sha256 and sha256 in self.deleted_shas)
-
-    def is_name_marked_deleted(self, name: Optional[str]) -> bool:
-        if not name:
-            return False
-        aliases = self._normalize_aliases_for_tombstone(name)
-        return any(alias in self.deleted_alias_map for alias in aliases)
-
-    def _normalize_aliases_for_tombstone(self, alias: Optional[str]) -> Set[str]:
-        normalized_aliases: Set[str] = set()
-        for token in self._canonical_aliases(alias):
-            if not token:
-                continue
-            normalized_aliases.add(token)
-            if token.startswith("files/"):
-                tail = token.split("files/", 1)[-1]
-                if tail and tail != token:
-                    normalized_aliases.add(tail)
-                    normalized_aliases.add(f"files/{tail}")
-            else:
-                normalized_aliases.add(f"files/{token}")
-        return normalized_aliases
-    
-    def get_all_entries(self) -> List[FileCacheEntry]:
-        return list(self.metadata_store.values())

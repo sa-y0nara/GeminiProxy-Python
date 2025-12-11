@@ -12,7 +12,7 @@ from app.core.log_utils import Logger
 from app.core.mime_utils import MimeUtils
 from app.core.utils import first_non_empty
 
-FILENAME_RE = re.compile(r'filename[*]?=["\\\"]?([^"\\\';\s]+)')
+FILENAME_RE = re.compile(r'filename\*?=["\']?([^"\'\s;]+)')
 
 
 class FileResolver:
@@ -37,12 +37,18 @@ class FileResolver:
             return f"upload_{uuid.uuid4().hex}"
 
         sanitized = filename_hint.strip()
-        sanitized = sanitized.replace("\\\\", "_").replace("/", "_").replace("..", "_")
+        
+        # 使用 Path.name 提取最终文件名部分，防止路径遍历
+        # 这会自动处理 /, \\, .., ... 等所有路径遍历变体
+        sanitized = Path(sanitized).name
+        
+        # 额外处理：移除可能残留的路径分隔符
+        sanitized = sanitized.replace("\\", "_").replace("/", "_")
+        
+        # 移除开头的点（隐藏文件），但保留扩展名中的点
+        sanitized = sanitized.lstrip(".")
 
-        while sanitized.startswith("."):
-            sanitized = sanitized[1:]
-
-        if not sanitized or len(sanitized) == 0:
+        if not sanitized:
             return f"upload_{uuid.uuid4().hex}"
 
         return sanitized

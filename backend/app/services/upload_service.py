@@ -1,47 +1,55 @@
+"""上传服务模块
+
+作为入口协调器，负责处理文件上传请求的路由和协调。
+"""
 
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, List, Set
+from typing import Optional, Tuple
 
-from fastapi import HTTPException, Request, Response, status
+from fastapi import HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-
 from app.core import manager
-from app.core.file_manager import file_manager, FileCacheEntry
+from app.core.file_manager import file_manager
 from app.core.log_utils import Logger
 from app.core.utils import parse_int_safe, first_non_empty
-from app.schemas.gemini_files import File, InitialUploadRequest
-
-# 导入新模块
+from app.schemas.gemini_files import InitialUploadRequest
+from app.services.chunked_upload_handler import chunked_upload_handler
 from app.services.file_resolver import file_resolver
 from app.services.response_builder import response_builder
-
+from app.services.stream_upload_handler import stream_upload_handler
+from app.services.upload_processor import upload_processor
 
 
 class UploadService:
-    def __init__(self):
-        pass
+    """上传服务 (入口协调器)
 
-    # =========================================================================
-    # 辅助方法
-    # =========================================================================
+    职责：
+    1. 初始化上传会话
+    2. 处理可续传上传请求
+    3. 处理 metadata-only 文件创建
+    4. 同步远程文件到缓存
+    5. 校验文件大小一致性
+    """
 
     def enforce_size_consistency(
         self,
         metadata: dict,
         actual_size: int,
         header_size: Optional[str],
-        *, 
+        *,
         request_id: str,
         session_id: str,
         file_path: Path,
         check_header: bool = True,
-    ):
+    ) -> None:
         """校验声明的文件大小与实际写入大小是否一致"""
         declared_size = metadata.get("size_bytes") or metadata.get("sizeBytes")
         declared_size_int = parse_int_safe(declared_size, label="sizeBytes")
-        header_size_int = parse_int_safe(header_size, label="Content-Length") if check_header else None
+        header_size_int = (
+            parse_int_safe(header_size, label="Content-Length") if check_header else None
+        )
 
         mismatch_errors = []
         if declared_size_int is not None and declared_size_int != actual_size:
@@ -57,7 +65,9 @@ class UploadService:
             try:
                 file_path.unlink(missing_ok=True)
             except Exception as cleanup_error:
-                Logger.warning("清理不一致的缓存文件失败", exc=cleanup_error, path=str(file_path))
+                Logger.warning(
+                    "清理不一致的缓存文件失败", exc=cleanup_error, path=str(file_path)
+                )
             file_manager.upload_sessions.pop(session_id, None)
             Logger.warning(
                 "上传被拒绝，声明大小与实际不符",
@@ -69,78 +79,21 @@ class UploadService:
                 detail="; ".join(mismatch_errors),
             )
 
-    def _ensure_unique_entry(self, sha256: str, request_id: str):
-        entry = file_manager.get_metadata_entry(sha256)
-        if entry and file_manager.is_marked_deleted(sha256):
-            Logger.info(
-                "检测到已删除文件重新上传，正在重置旧的元数据",
-                sha256=sha256[:8],
-                request_id=request_id,
-            )
-            file_manager.delete_entry(sha256)
-            return None
-        return entry
-
-    async def _sync_to_gemini(
+    def _extract_request_metadata(
         self,
+        body: Optional[InitialUploadRequest],
         *,
-        sha256: str,
-        entry: FileCacheEntry,
-        request: Request,
-        request_id: str,
-        size_bytes: int,
+        required: bool = False,
     ) -> dict:
-        # manager is passed in implicitly through closure or explicitly as arg, assuming explicit here for clarity
-        gemini_file, client_id = await manager.upload_file_from_cache(sha256)
-        Logger.api_response(request_id, f"文件同步上传成功 | {client_id}")
-
-        remote_file, _, _ = await self.sync_remote_file_to_cache(
-            request=request,
-            file_name=gemini_file.get("name"),
-            request_id=request_id,
-            reason="get",
-            preferred_client_id=client_id,
-            allow_deleted=True,
+        """统一处理上传入口处的 metadata 判空与提取"""
+        metadata = (
+            body.file.model_dump(by_alias=True, exclude_none=True)
+            if body and body.file
+            else {}
         )
-        if remote_file:
-            return response_builder.build_file_response(remote_file, entry, size_bytes)
-
-        file_manager.update_replication_status(
-            sha256,
-            client_id,
-            "synced",
-            gemini_file,
-        )
-        return response_builder.build_file_response(gemini_file, entry, size_bytes)
-
-
-    def _handle_offline_fallback(self, *, sha256: str, entry: FileCacheEntry, request_id: str) -> dict:
-        Logger.warning("没有可用的WebSocket客户端连接，但文件已保存到本地缓存", request_id=request_id)
-        try:
-            local_file_data = response_builder.default_file_payload(entry, sha256, size_bytes=entry.size_bytes)
-            file_manager.update_replication_status(sha256, "local", "synced", local_file_data)
-            Logger.api_response(request_id, "文件已保存到本地缓存（离线模式）")
-            return local_file_data
-        except Exception as exc:
-            Logger.error("创建本地文件条目失败", exc=exc, request_id=request_id)
-            raise HTTPException(
-                status_code=503,
-                detail="No frontend clients available. Please ensure the browser client is connected.",
-            ) from exc
-
-
-    async def persist_body_to_cache(self, request: Request, filename_hint: Optional[str]):
-        """将请求体保存到缓存，避免一次性读取全部内容。"""
-
-        body_stream = request.stream()
-
-        async def iterator():
-            async for chunk in body_stream:
-                if chunk:
-                    yield chunk
-
-        temp_name = file_resolver.sanitize_filename_hint(filename_hint)
-        return await file_manager.save_stream_to_cache(iterator(), temp_name)
+        if required and not metadata:
+            raise HTTPException(status_code=400, detail="file metadata is required")
+        return metadata
 
     async def sync_remote_file_to_cache(
         self,
@@ -152,7 +105,7 @@ class UploadService:
         preferred_client_id: Optional[str] = None,
         allow_deleted: bool = False,
     ) -> Tuple[Optional[dict], Optional[str], bool]:
-        """Fetch remote metadata, update cache, and report deletion status."""
+        """获取远程文件元数据并更新缓存"""
         if not file_name:
             return None, None, False
 
@@ -167,7 +120,9 @@ class UploadService:
                 )
                 verify_client_id = preferred_client_id
             else:
-                async with manager.monitored_proxy_request(verify_request_id, request) as verify_client_id:
+                async with manager.monitored_proxy_request(
+                    verify_request_id, request
+                ) as verify_client_id:
                     response = await manager.proxy_request(
                         command_type="get_file",
                         payload={"file_name": file_name},
@@ -212,278 +167,41 @@ class UploadService:
 
         return remote_file, remote_sha, False
 
-
-    def _extract_request_metadata(
-        self,
-        body: Optional[InitialUploadRequest],
-        *,
-        required: bool = False,
-    ) -> dict:
-        """统一处理上传入口处的 metadata 判空与提取。"""
-        metadata = body.file.model_dump(by_alias=True, exclude_none=True) if body and body.file else {}
-        if required and not metadata:
-            raise HTTPException(status_code=400, detail="file metadata is required")
-        return metadata
-
-
-    def _parse_upload_commands(self, header_value: Optional[str]) -> Set[str]:
-        if not header_value:
-            return set()
-        return {token.strip().lower() for token in header_value.split(",") if token.strip()}
-
-
-    async def _handle_chunked_upload(
-        self,
-        *,
-        request: Request,
-        session_id: str,
-        metadata: dict,
-        request_id: str,
-        upload_offset_header: Optional[str],
-        finalize_requested: bool,
-    ) -> Response | Tuple[str, Path, int]:
-        try:
-            upload_offset_int = int(upload_offset_header or 0)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid X-Goog-Upload-Offset header.")
-
-        chunk_data = await request.body()
-        try:
-            new_offset = file_manager.append_chunk_data(session_id, chunk_data, upload_offset_int)
-        except ValueError as offset_error:
-            file_manager.discard_chunk_upload(session_id)
-            file_manager.upload_sessions.pop(session_id, None)
-            raise HTTPException(status_code=400, detail=str(offset_error))
-
-        if not finalize_requested:
-            return Response(
-                status_code=308,
-                headers={
-                    "X-Goog-Upload-Status": "active",
-                    "X-Goog-Upload-Offset": str(new_offset),
-                },
-            )
-
-        try:
-            sha256, file_path, size_bytes = file_manager.finalize_chunk_upload(session_id)
-        except ValueError as finalize_error:
-            file_manager.upload_sessions.pop(session_id, None)
-            raise HTTPException(status_code=400, detail=str(finalize_error))
-
-        self.enforce_size_consistency(
-            metadata,
-            size_bytes,
-            header_size=None,
-            request_id=request_id,
-            session_id=session_id,
-            file_path=file_path,
-            check_header=False,
-        )
-        return sha256, file_path, size_bytes
-
-
-    async def _handle_stream_upload(
-        self,
-        *,
-        request: Request,
-        filename_hint: Optional[str],
-        metadata: dict,
-        request_id: str,
-        session_id: str,
-    ) -> Tuple[str, Path, int]:
-        try:
-            sha256, file_path, size_bytes = await self.persist_body_to_cache(request, filename_hint)
-        except Exception as exc:
-            Logger.error("保存文件到缓存失败", exc=exc)
-            raise HTTPException(status_code=500, detail="Failed to save file to cache.") from exc
-
-        self.enforce_size_consistency(
-            metadata,
-            size_bytes,
-            header_size=request.headers.get("content-length"),
-            request_id=request_id,
-            session_id=session_id,
-            file_path=file_path,
-            check_header=True,
-        )
-        return sha256, file_path, size_bytes
-
-
-    async def _process_cached_file_upload(
-        self,
-        *,
-        request: Request,
-        sha256: str,
-        file_path: Path,
-        size_bytes: int,
-        metadata: Optional[dict],
-        request_id: str,
-        session_id: Optional[str],
-        filename_hint: Optional[str],
-        content_type_hint: Optional[str],
-    ) -> JSONResponse:
-        """共享的缓存文件上传处理逻辑"""
-        metadata = metadata or {}
-        entry = self._ensure_unique_entry(sha256, request_id)
-
-        if entry:
-            resolved_file = await self._ensure_valid_remote_entry(entry, request=request, request_id=request_id)
-            Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]})")
-            if session_id:
-                file_manager.upload_sessions.pop(session_id, None)
-            file_manager.clear_deleted_flag(sha256)
-            return response_builder.build_final_upload_response(resolved_file, request=request)
-
-        final_filename, final_mime = file_resolver.resolve_filename_and_mime(
-            sha256,
-            metadata,
-            filename_hint,
-            content_type_hint,
-            file_path,
-            request_id,
-        )
-
-        entry = file_manager.create_metadata_entry(
-            sha256=sha256,
-            file_path=file_path,
-            filename=final_filename,
-            mime_type=final_mime,
-            size_bytes=size_bytes,
-        )
-
-        Logger.info(
-            f"创建文件元数据 - SHA256: {sha256[:8]}, 文件名: {final_filename}, MIME: {final_mime}",
-            request_id=request_id,
-        )
-
-        try:
-            file_data = await self._sync_to_gemini(
-                sha256=sha256,
-                entry=entry,
-                request=request,
-                request_id=request_id,
-                size_bytes=size_bytes,
-            )
-        except HTTPException as exc:
-            if exc.status_code == 503:
-                file_data = self._handle_offline_fallback(
-                    sha256=sha256,
-                    entry=entry,
-                    request_id=request_id,
-                )
-            else:
-                raise
-        except Exception as exc:
-            Logger.error("上传过程中发生未预期的错误", exc=exc)
-            raise HTTPException(status_code=500, detail=f"Upload failed: {str(exc)}")
-        finally:
-            if session_id:
-                file_manager.upload_sessions.pop(session_id, None)
-
-        file_manager.clear_deleted_flag(sha256)
-        return response_builder.build_final_upload_response(file_data, request=request)
-
-
-    async def _ensure_valid_remote_entry(
-        self,
-        entry: FileCacheEntry,
-        *,
-        request: Request,
-        request_id: str,
-    ) -> File:
-        """
-        Reuses an existing cached entry by verifying at least one remote replica.
-        If none of the replicas are valid, synchronously rebuilds the remote copy.
-        """
-        sha256 = entry.sha256
-        candidates: List[Tuple[str, str]] = [
-            (client_id, data.get("name"))
-            for client_id, data in entry.replication_map.items()
-            if data.get("status") == "synced" and data.get("name")
-        ]
-
-        for client_id, remote_name in candidates:
-            remote_file, _, _ = await self.sync_remote_file_to_cache(
-                request=request,
-                file_name=remote_name,
-                request_id=request_id,
-                reason="dedup-verify",
-                preferred_client_id=client_id,
-            )
-            if remote_file:
-                return File.model_validate(remote_file)
-
-        Logger.warning(
-            "缓存命中但没有可用的远端副本，开始同步重建",
-            sha256=sha256[:8],
-            request_id=request_id,
-        )
-
-        file_manager.reset_replication_map(sha256)
-        try:
-            gemini_file, client_id = await manager.upload_file_from_cache(sha256)
-            Logger.event(
-                "REUSE_REBUILD",
-                "缓存文件已重新上传",
-                sha256=sha256[:8],
-                client_id=client_id,
-            )
-            remote_file, _, _ = await self.sync_remote_file_to_cache(
-                request=request,
-                file_name=gemini_file.get("name"),
-                request_id=request_id,
-                reason="dedup-rebuild",
-                preferred_client_id=client_id,
-            )
-            if remote_file:
-                return File.model_validate(remote_file)
-            file_manager.update_replication_status(
-                sha256,
-                client_id,
-                "synced",
-                gemini_file,
-            )
-            return File.model_validate(gemini_file)
-        except Exception as exc:
-            Logger.error(
-                "缓存文件重建失败，返回本地映射",
-                exc=exc,
-                sha256=sha256[:8],
-                request_id=request_id,
-            )
-            fallback_file = response_builder.build_file_response(None, entry, entry.size_bytes)
-            return File.model_validate(fallback_file)
-    
-    async def initiate_upload_session(self, request: Request, body: InitialUploadRequest) -> Response:
-        """
-        初始化一个模拟的可续传上传会话，绑定到客户端以防止会话劫持。
-        """
+    async def initiate_upload_session(
+        self, request: Request, body: InitialUploadRequest
+    ) -> Response:
+        """初始化一个模拟的可续传上传会话"""
         session_id = str(uuid.uuid4())
-        client_id = request.headers.get("X-Client-ID") or request.headers.get("x-client-id") or "anonymous"
+        client_id = (
+            request.headers.get("X-Client-ID")
+            or request.headers.get("x-client-id")
+            or "anonymous"
+        )
         metadata = self._extract_request_metadata(body)
         file_manager.start_upload_session(session_id, client_id, metadata)
 
-        proxy_upload_url = f"{response_builder.determine_proxy_base_url(request)}/v1beta/files/upload/{session_id}"
+        proxy_upload_url = (
+            f"{response_builder.determine_proxy_base_url(request)}/v1beta/files/upload/{session_id}"
+        )
 
         return Response(
             headers={
                 "X-Goog-Upload-URL": proxy_upload_url,
                 "X-Goog-Upload-Status": "active",
-                "X-Client-ID": client_id,  # 返回客户端 ID 便于验证
+                "X-Client-ID": client_id,
             },
         )
-    
-    async def handle_resumable_upload(self, request: Request, session_id: str) -> JSONResponse:
-        """
-        接收文件内容，并触发完整的方案 B 上传/同步逻辑。
-        支持自动重试机制以处理临时连接问题。
-        """
+
+    async def handle_resumable_upload(
+        self, request: Request, session_id: str
+    ) -> JSONResponse:
+        """接收文件内容，并触发完整的上传/同步逻辑"""
         client_id = request.headers.get("X-Client-ID") or request.headers.get("x-client-id")
-        
+
         session = file_manager.get_upload_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Upload session not found.")
-        
+
         if client_id and session.client_id != client_id:
             Logger.warning(
                 "会话客户端验证失败，拒绝访问",
@@ -494,49 +212,62 @@ class UploadService:
             raise HTTPException(status_code=403, detail="Session client mismatch.")
 
         metadata = dict(session.metadata or {})
-
-        filename_hint = first_non_empty(metadata, "display_name", "displayName", "filename", "fileName") or "untitled"
+        filename_hint = (
+            first_non_empty(metadata, "display_name", "displayName", "filename", "fileName")
+            or "untitled"
+        )
 
         request_id = str(uuid.uuid4())
         Logger.api_request(request_id, f"文件内容上传 | {filename_hint}")
 
         content_type = request.headers.get("content-type", "unknown")
         content_length = request.headers.get("content-length", "unknown")
-        Logger.info(f"文件上传请求 - MIME: {content_type}, 大小: {content_length}", request_id=request_id)
+        Logger.info(
+            f"文件上传请求 - MIME: {content_type}, 大小: {content_length}",
+            request_id=request_id,
+        )
 
+        # 从请求头提取文件名
         content_disposition = request.headers.get("content-disposition", "")
         header_filename = file_resolver.parse_filename_from_headers(content_disposition)
         if header_filename:
             filename_hint = header_filename
             Logger.info(f"从请求头中提取文件名: {filename_hint}", request_id=request_id)
 
-        command_tokens = self._parse_upload_commands(request.headers.get("x-goog-upload-command") or "")
+        # 判断上传类型
+        command_tokens = chunked_upload_handler.parse_upload_commands(
+            request.headers.get("x-goog-upload-command") or ""
+        )
         upload_offset_header = request.headers.get("x-goog-upload-offset")
-        is_chunked_upload = bool(command_tokens) or upload_offset_header is not None
+        is_chunked = chunked_upload_handler.is_chunked_upload(
+            command_tokens, upload_offset_header
+        )
         finalize_requested = "finalize" in command_tokens
 
-        if is_chunked_upload:
-            chunk_result = await self._handle_chunked_upload(
+        if is_chunked:
+            chunk_result = await chunked_upload_handler.handle_chunked_upload(
                 request=request,
                 session_id=session_id,
                 metadata=metadata,
                 request_id=request_id,
                 upload_offset_header=upload_offset_header,
                 finalize_requested=finalize_requested,
+                size_validator=self.enforce_size_consistency,
             )
             if isinstance(chunk_result, Response):
                 return chunk_result
             sha256, file_path, size_bytes = chunk_result
         else:
-            sha256, file_path, size_bytes = await self._handle_stream_upload(
+            sha256, file_path, size_bytes = await stream_upload_handler.handle_stream_upload(
                 request=request,
                 filename_hint=filename_hint,
                 metadata=metadata,
                 request_id=request_id,
                 session_id=session_id,
+                size_validator=self.enforce_size_consistency,
             )
 
-        return await self._process_cached_file_upload(
+        return await upload_processor.process_cached_file_upload(
             request=request,
             sha256=sha256,
             file_path=file_path,
@@ -546,9 +277,12 @@ class UploadService:
             session_id=session_id,
             filename_hint=filename_hint,
             content_type_hint=request.headers.get("content-type"),
+            sync_remote_callback=self.sync_remote_file_to_cache,
         )
-    
-    async def create_metadata_only_file(self, request: Request, body: InitialUploadRequest) -> JSONResponse:
+
+    async def create_metadata_only_file(
+        self, request: Request, body: InitialUploadRequest
+    ) -> JSONResponse:
         """处理 metadata-only 文件创建请求"""
         request_id = str(uuid.uuid4())
         metadata = self._extract_request_metadata(body, required=True)
@@ -565,7 +299,9 @@ class UploadService:
 
         remote_file = response_builder.extract_file_payload(response_data)
         if not isinstance(remote_file, dict):
-            raise HTTPException(status_code=502, detail="Invalid response from frontend client")
+            raise HTTPException(
+                status_code=502, detail="Invalid response from frontend client"
+            )
 
         entry = file_manager.ensure_remote_entry(remote_file)
         if entry:
