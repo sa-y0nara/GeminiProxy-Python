@@ -1,6 +1,5 @@
 {
-  "name": "Gemini Proxy Frontend",
-  "description": "",
-  "requestFramePermissions": [],
-  "prompt": ""
+  "name": "Copy of Copy of Gemini Multiverse Hub",
+  "description": "A comprehensive interface exploring Gemini 2.5's capabilities including multimodal chat, image generation, and text-to-speech synthesis.",
+  "requestFramePermissions": []
 }
